@@ -5,11 +5,12 @@ FastAPI application for analyzing loan documents using PDF extraction + LLM.
 """
 
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from models.schemas import (
@@ -129,29 +130,87 @@ async def process_document(doc_id: str):
         pdf_bytes = doc["content"]
         
         # Step 1: Extract text and numeric candidates from PDF
-        extraction = pdf_extractor.extract_numbers(pdf_bytes)
+        print(f"DEBUG: Starting PDF extraction for document {doc_id}")
+        extraction = await pdf_extractor.extract_numbers(pdf_bytes)
+        # #region agent log
+        import json as _j2; open(r'c:\Users\bring\Desktop\loan_app\.cursor\debug.log','a').write(_j2.dumps({"hypothesisId":"H2","location":"main.py:process_document:after_extract","message":"extract_numbers returned","data":{"text_len":len(extraction.full_text)},"timestamp":__import__('time').time()})+'\n')
+        # #endregion
+        print(f"DEBUG: PDF extraction completed. Text length: {len(extraction.full_text)} chars")
         
         # Store extraction for later use by other endpoints
         doc["extraction"] = extraction
         
         # Step 2: Generate summary using LLM (or fallback to regex-only)
+        print(f"DEBUG: Starting LLM analysis for document {doc_id}")
+        # #region agent log
+        import json as _j3; open(r'c:\Users\bring\Desktop\loan_app\.cursor\debug.log','a').write(_j3.dumps({"hypothesisId":"H5","location":"main.py:process_document:before_llm","message":"About to call analyze_for_summary","data":{"doc_id":doc_id},"timestamp":__import__('time').time()})+'\n')
+        # #endregion
         try:
             summary_data = await analyze_for_summary(extraction, pdf_extractor)
+            print(f"DEBUG: LLM analysis completed successfully for document {doc_id}")
         except Exception as llm_error:
             # Fallback to regex-only if LLM fails
             print(f"LLM analysis failed: {llm_error}, using regex fallback")
             summary_data = generate_summary_from_regex_only(extraction)
             
             if summary_data is None:
-                raise Exception("Insufficient data found in document")
+                # Provide detailed error about what's missing
+                candidates = extraction.numeric_candidates
+                found_items = []
+                if candidates.loan_amounts:
+                    found_items.append(f"loan amount ({len(candidates.loan_amounts)} found)")
+                if candidates.interest_rates:
+                    found_items.append(f"interest rate ({len(candidates.interest_rates)} found)")
+                if candidates.term_months:
+                    found_items.append(f"loan term ({len(candidates.term_months)} found)")
+                
+                missing_items = []
+                if not candidates.loan_amounts:
+                    missing_items.append("loan amount")
+                if not candidates.interest_rates:
+                    missing_items.append("interest rate")
+                if not candidates.term_months:
+                    missing_items.append("loan term")
+                
+                # Check if document is scanned/image-based
+                doc_text_length = len(extraction.full_text.strip())
+                is_scanned = doc_text_length < 100
+                
+                if is_scanned:
+                    error_msg = (
+                        f"LlamaParse extracted very little text (only {doc_text_length} characters). "
+                        f"This could indicate: "
+                        f"(1) The document is scanned/image-based and LlamaParse OCR didn't extract text properly, "
+                        f"(2) LlamaParse API didn't return the content even though the job completed, or "
+                        f"(3) The document format is not supported. "
+                        f"Please check the LlamaParse dashboard to see if the job processed correctly. "
+                        f"Missing required fields: {', '.join(missing_items)}."
+                    )
+                else:
+                    error_msg = (
+                        f"Insufficient data found in document. "
+                        f"Found: {', '.join(found_items) if found_items else 'nothing'}. "
+                        f"Missing required fields: {', '.join(missing_items)}. "
+                        f"Please ensure the document contains loan amount, interest rate, and loan term information."
+                    )
+                raise Exception(error_msg)
         
         # Store summary
+        print(f"DEBUG: Storing summary for document {doc_id}")
         summaries_store[doc_id] = {
             "status": "complete",
             "data": summary_data
         }
+        print(f"DEBUG: Summary stored successfully. Status: {summaries_store[doc_id]['status']}")
+        print(f"DEBUG: Verifying store - summaries_store now has {len(summaries_store)} entries: {list(summaries_store.keys())}")
+        print(f"DEBUG: Verifying stored summary for {doc_id} exists: {doc_id in summaries_store}")
+        if doc_id in summaries_store:
+            stored_status = summaries_store[doc_id].get('status')
+            has_data = 'data' in summaries_store[doc_id] and summaries_store[doc_id]['data'] is not None
+            print(f"DEBUG: Stored summary status: {stored_status}, has_data: {has_data}")
         
         doc["status"] = "complete"
+        print(f"DEBUG: Document {doc_id} status updated to: {doc['status']}")
         
     except Exception as e:
         print(f"Document processing failed: {e}")
@@ -167,19 +226,46 @@ async def process_document(doc_id: str):
 # ==========================================================================
 
 @app.get("/documents/{document_id}/summary", response_model=SummaryResponse)
-async def get_summary(document_id: str):
+async def get_summary(document_id: str, response: Response):
     """
     Get the analyzed summary of a loan document.
     
     Returns key numbers (loan amount, interest rate, term, payments)
     and highlights about the loan terms.
     """
+    # Add cache-control headers to prevent caching
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["X-Request-Time"] = str(time.time())  # Add timestamp to help debug caching
+    
+    current_time = time.time()
+    print(f"DEBUG: get_summary called for document {document_id} at {current_time}")
+    print(f"DEBUG: summaries_store has {len(summaries_store)} entries: {list(summaries_store.keys())}")
+    
     # Check document exists
     if document_id not in documents_store:
         raise HTTPException(status_code=404, detail="Document not found")
     
+    doc = documents_store[document_id]
+    doc_status = doc.get("status", "unknown")
+    print(f"DEBUG: Document status: {doc_status}")
+    
     # Check if summary is ready
     if document_id not in summaries_store:
+        print(f"DEBUG: Summary not found in store for {document_id}")
+        print(f"DEBUG: Document status is: {doc_status}")
+        print(f"DEBUG: Available document IDs in store: {list(documents_store.keys())}")
+        print(f"DEBUG: Available summary IDs in store: {list(summaries_store.keys())}")
+        # If document processing failed, return failed status
+        if doc_status == "failed":
+            return SummaryResponse(
+                document_id=document_id,
+                status="failed",
+                error="Document processing failed"
+            )
+        # Otherwise, still processing
+        print(f"DEBUG: Returning processing status at {current_time}")
         return SummaryResponse(
             document_id=document_id,
             status="processing",
@@ -187,8 +273,15 @@ async def get_summary(document_id: str):
         )
     
     summary = summaries_store[document_id]
+    summary_status = summary.get("status", "unknown")
+    print(f"DEBUG: Found summary in store for {document_id}")
+    print(f"DEBUG: Summary status from store: {summary_status}")
+    print(f"DEBUG: Summary keys: {list(summary.keys())}")
+    print(f"DEBUG: Has 'data' key: {'data' in summary}")
+    print(f"DEBUG: Data is None: {summary.get('data') is None}")
     
-    if summary["status"] == "failed":
+    if summary_status == "failed":
+        print(f"DEBUG: Summary status is 'failed', returning failed response")
         return SummaryResponse(
             document_id=document_id,
             status="failed",
@@ -196,28 +289,60 @@ async def get_summary(document_id: str):
         )
     
     # Build response from stored data
-    data = summary["data"]
-    
-    return SummaryResponse(
-        document_id=document_id,
-        status="complete",
-        data=SummaryData(
-            document_type=data["document_type"],
-            overview=data["overview"],
-            key_numbers=KeyNumbers(
-                total_loan=data["key_numbers"]["total_loan"],
-                monthly_payment=data["key_numbers"]["monthly_payment"],
-                interest_rate=data["key_numbers"]["interest_rate"],
-                term_months=data["key_numbers"]["term_months"],
-                total_interest=data["key_numbers"]["total_interest"],
-                fees=data["key_numbers"].get("fees")
-            ),
-            highlights=[
-                Highlight(type=h["type"], text=h["text"]) 
-                for h in data["highlights"]
-            ]
+    try:
+        data = summary.get("data")
+        if data is None:
+            print(f"ERROR: Summary data is None for {document_id} even though summary exists")
+            print(f"DEBUG: Full summary object: {summary}")
+            raise HTTPException(status_code=500, detail="Summary data is empty")
+        
+        print(f"DEBUG: Building response for {document_id}, data keys: {list(data.keys()) if data else 'None'}")
+        
+        # Validate data structure
+        if not data:
+            print(f"ERROR: Summary data is None for {document_id}")
+            raise HTTPException(status_code=500, detail="Summary data is empty")
+        
+        if "key_numbers" not in data:
+            print(f"ERROR: Missing 'key_numbers' in data for {document_id}")
+            print(f"DEBUG: Data keys: {list(data.keys())}")
+            raise HTTPException(status_code=500, detail="Summary data is missing key_numbers")
+        
+        response = SummaryResponse(
+            document_id=document_id,
+            status="complete",
+            data=SummaryData(
+                document_type=data.get("document_type", "Loan Agreement"),
+                overview=data.get("overview", ""),
+                key_numbers=KeyNumbers(
+                    total_loan=data["key_numbers"].get("total_loan"),
+                    monthly_payment=data["key_numbers"].get("monthly_payment"),
+                    interest_rate=data["key_numbers"].get("interest_rate"),
+                    term_months=data["key_numbers"].get("term_months"),
+                    total_interest=data["key_numbers"].get("total_interest"),
+                    fees=data["key_numbers"].get("fees")
+                ),
+                highlights=[
+                    Highlight(type=h.get("type", "warning"), text=h.get("text", "")) 
+                    for h in data.get("highlights", [])
+                ]
+            )
         )
-    )
+        print(f"DEBUG: Successfully built response for {document_id} at {current_time}")
+        print(f"DEBUG: Response status will be: complete")
+        return response
+        
+    except KeyError as e:
+        print(f"ERROR: Missing key in summary for {document_id}: {e}")
+        print(f"DEBUG: Summary keys: {list(summary.keys())}")
+        if "data" in summary:
+            print(f"DEBUG: Data keys: {list(summary['data'].keys()) if summary['data'] else 'None'}")
+        raise HTTPException(status_code=500, detail=f"Summary data is malformed: {str(e)}")
+    except Exception as e:
+        print(f"ERROR: Failed to build response for {document_id}: {type(e).__name__}: {e}")
+        import traceback
+        print(f"DEBUG: Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to build response: {str(e)}")
 
 
 # ==========================================================================
@@ -225,21 +350,30 @@ async def get_summary(document_id: str):
 # ==========================================================================
 
 @app.get("/documents/{document_id}/red-flags", response_model=RedFlagsResponse)
-async def get_red_flags(document_id: str):
+async def get_red_flags(document_id: str, response: Response):
     """
     Get AI-detected red flags in the loan document.
     
     Red flags are unfavorable terms, unusual clauses, or potentially
     harmful conditions that the borrower should be aware of.
     """
+    # Add cache-control headers to prevent caching
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["X-Request-Time"] = str(time.time())
+    
     # Check document exists
     if document_id not in documents_store:
         raise HTTPException(status_code=404, detail="Document not found")
     
     doc = documents_store[document_id]
+    current_time = time.time()
+    print(f"DEBUG: get_red_flags called for document {document_id} at {current_time}")
     
     # Check if extraction is ready
     if "extraction" not in doc:
+        print(f"DEBUG: Extraction not ready for {document_id}, returning processing status")
         return RedFlagsResponse(
             document_id=document_id,
             status="processing",
@@ -248,7 +382,9 @@ async def get_red_flags(document_id: str):
         )
     
     # Check if we already analyzed this document
+    print(f"DEBUG: red_flags_store has {len(red_flags_store)} entries: {list(red_flags_store.keys())}")
     if document_id in red_flags_store:
+        print(f"DEBUG: Found red flags in store for {document_id}")
         stored = red_flags_store[document_id]
         if stored["status"] == "failed":
             return RedFlagsResponse(
@@ -323,21 +459,30 @@ async def get_red_flags(document_id: str):
 # ==========================================================================
 
 @app.get("/documents/{document_id}/hidden-clauses", response_model=HiddenClausesResponse)
-async def get_hidden_clauses(document_id: str):
+async def get_hidden_clauses(document_id: str, response: Response):
     """
     Get AI-detected hidden clauses in the loan document.
     
     Hidden clauses are complex legal language that is buried or easy to miss,
     translated to plain English for the borrower to understand.
     """
+    # Add cache-control headers to prevent caching
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["X-Request-Time"] = str(time.time())
+    
     # Check document exists
     if document_id not in documents_store:
         raise HTTPException(status_code=404, detail="Document not found")
     
     doc = documents_store[document_id]
+    current_time = time.time()
+    print(f"DEBUG: get_hidden_clauses called for document {document_id} at {current_time}")
     
     # Check if extraction is ready
     if "extraction" not in doc:
+        print(f"DEBUG: Extraction not ready for {document_id}, returning processing status")
         return HiddenClausesResponse(
             document_id=document_id,
             status="processing",
@@ -346,7 +491,9 @@ async def get_hidden_clauses(document_id: str):
         )
     
     # Check if we already analyzed this document
+    print(f"DEBUG: hidden_clauses_store has {len(hidden_clauses_store)} entries: {list(hidden_clauses_store.keys())}")
     if document_id in hidden_clauses_store:
+        print(f"DEBUG: Found hidden clauses in store for {document_id}")
         stored = hidden_clauses_store[document_id]
         if stored["status"] == "failed":
             return HiddenClausesResponse(
@@ -420,13 +567,14 @@ async def get_hidden_clauses(document_id: str):
         )
 
 
-# ==========================================================================
+# =========================================================================
 # FINANCIAL TERMS ENDPOINT
 # ==========================================================================
 
 @app.get("/documents/{document_id}/financial-terms", response_model=FinancialTermsResponse)
 async def get_financial_terms(
-    document_id: str, 
+    document_id: str,
+    response: Response,
     search: Optional[str] = Query(None, description="Filter terms by keyword")
 ):
     """
@@ -438,14 +586,23 @@ async def get_financial_terms(
     Query Parameters:
     - search: Optional keyword to filter terms (e.g., "apr", "principal")
     """
+    # Add cache-control headers to prevent caching
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["X-Request-Time"] = str(time.time())
+    
     # Check document exists
     if document_id not in documents_store:
         raise HTTPException(status_code=404, detail="Document not found")
     
     doc = documents_store[document_id]
+    current_time = time.time()
+    print(f"DEBUG: get_financial_terms called for document {document_id} at {current_time}")
     
     # Check if extraction is ready
     if "extraction" not in doc:
+        print(f"DEBUG: Extraction not ready for {document_id}, returning processing status")
         return FinancialTermsResponse(
             document_id=document_id,
             status="processing",
@@ -454,7 +611,9 @@ async def get_financial_terms(
         )
     
     # Check if we already analyzed this document
+    print(f"DEBUG: financial_terms_store has {len(financial_terms_store)} entries: {list(financial_terms_store.keys())}")
     if document_id in financial_terms_store:
+        print(f"DEBUG: Found financial terms in store for {document_id}")
         stored = financial_terms_store[document_id]
         if stored["status"] == "failed":
             return FinancialTermsResponse(
