@@ -6,14 +6,16 @@ This module handles:
 2. Generating summary, highlights, and document type classification
 3. Computing derived values (monthly payment, total interest)
 
-Uses Google Gemini API for LLM analysis.
+Uses Groq Cloud API (qwen/qwen3-32b) with JSON mode for structured output.
+Pydantic models define the expected output schemas and are injected into prompts.
 """
 
 import json
 import os
-from typing import Optional
+import asyncio
+from typing import List, Optional, Literal
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-
 from services.pdf_extractor import (
     PDFExtraction, 
     calculate_monthly_payment, 
@@ -24,129 +26,237 @@ from services.pdf_extractor import (
 load_dotenv()
 
 
-# Lazy-loaded Gemini model (only created when needed)
-_model = None
+# ==========================================================================
+# PYDANTIC MODELS FOR LLM STRUCTURED OUTPUT
+# ==========================================================================
+# These models define the expected JSON structure. Their JSON schemas are
+# injected into prompts, and JSON mode guarantees valid JSON syntax.
+
+# --- Shared ---
+class LLMLocation(BaseModel):
+    page: int
+    section: str
 
 
-def get_gemini_model():
-    """Get Gemini model, creating it lazily. Returns None if no API key."""
-    global _model
-    
-    if _model is not None:
-        return _model
-    
-    api_key = os.environ.get("GEMINI_API_KEY")
+# --- Summary Extraction ---
+class SummaryKeyNumbers(BaseModel):
+    total_loan: float = Field(description="Principal loan amount")
+    interest_rate: float = Field(description="Annual interest rate as percentage")
+    term_months: int = Field(description="Loan term in months")
+    monthly_payment: Optional[float] = Field(None, description="Monthly payment if stated, otherwise null")
+    fees: Optional[float] = Field(None, description="Total fees if found, otherwise null")
+
+
+class SummaryHighlight(BaseModel):
+    type: Literal["positive", "negative", "warning"]
+    text: str = Field(description="Short highlight statement")
+
+
+class SummaryConfidence(BaseModel):
+    loan_amount: Literal["high", "medium", "low"]
+    interest_rate: Literal["high", "medium", "low"]
+    term: Literal["high", "medium", "low"]
+
+
+class SummaryExtractionResponse(BaseModel):
+    document_type: str = Field(description="Type of loan document (e.g., Personal Loan Agreement, Mortgage, Auto Loan)")
+    overview: str = Field(description="2-3 sentence plain English summary of the loan for a non-expert")
+    key_numbers: SummaryKeyNumbers
+    highlights: List[SummaryHighlight] = Field(description="3-5 key highlights about the loan terms")
+    confidence: SummaryConfidence
+
+
+# --- Red Flags ---
+class RedFlagItem(BaseModel):
+    severity: Literal["high", "medium", "low"] = Field(description="Severity based on financial impact to borrower")
+    title: str = Field(description="Short, clear title for the red flag")
+    description: str = Field(description="Explanation of why this is problematic for the borrower")
+    location: LLMLocation
+    recommendation: str = Field(description="Specific, actionable advice for the borrower")
+
+
+class RedFlagsLLMResponse(BaseModel):
+    red_flags: List[RedFlagItem] = Field(description="List of red flags found in the document")
+
+
+# --- Hidden Clauses ---
+class HiddenClauseItem(BaseModel):
+    category: str = Field(description="Category: prepayment, arbitration, fees, liability, default, insurance, modification, etc.")
+    title: str = Field(description="Short, clear title for the clause")
+    summary: str = Field(description="One-line summary of what this clause means")
+    original_text: str = Field(description="Exact text extracted from the document (can be abbreviated with ...)")
+    plain_english: str = Field(description="Translation to simple, plain English that anyone can understand")
+    impact: Literal["high", "medium", "low"] = Field(description="Impact level on the borrower")
+    location: LLMLocation
+
+
+class HiddenClausesLLMResponse(BaseModel):
+    hidden_clauses: List[HiddenClauseItem] = Field(description="List of hidden or complex clauses found in the document")
+
+
+# --- Financial Terms ---
+class TermExampleItem(BaseModel):
+    icon: Literal["\U0001f4a1", "\u26a0\ufe0f", "\u2705"] = Field(description="Icon: lightbulb for info, warning for caution, checkmark for positive")
+    title: str = Field(description="Short title for the example, max 5 words")
+    text: str = Field(description="Example using actual values from this document, max 25 words")
+
+
+class FinancialTermItem(BaseModel):
+    name: str = Field(description="Term name as it appears in the document (e.g., APR, MCLR, EMI)")
+    full_name: str = Field(description="Expanded name if abbreviated (e.g., Annual Percentage Rate)")
+    short_description: str = Field(description="One-line summary, max 15 words")
+    definition: str = Field(description="Plain English explanation for a non-expert borrower, max 30 words")
+    example: TermExampleItem
+    your_value: str = Field(description="The actual value of this term in the document (e.g., '13.2%', '$500', '60 months')")
+    location: LLMLocation
+
+
+class FinancialTermsLLMResponse(BaseModel):
+    terms: List[FinancialTermItem] = Field(description="List of 5-8 most important financial terms found in the document")
+
+
+# ==========================================================================
+# GROQ API HELPERS
+# ==========================================================================
+
+def _get_groq_client():
+    """Create and return an async Groq client with API key from environment."""
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        return None
-    
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    _model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        generation_config={
-            "temperature": 0.2,
-            "top_p": 0.95,
-            "top_k": 40,
-            "max_output_tokens": 8192,
-            "response_mime_type": "application/json",
-        }
-    )
-    return _model
+        raise RuntimeError("GROQ_API_KEY environment variable not set")
+    from groq import AsyncGroq
+    return AsyncGroq(api_key=api_key)
 
 
-async def call_gemini(system_prompt: str, user_prompt: str) -> dict:
+def _extract_json_from_response(text: str) -> str:
     """
-    Call Gemini API and return parsed JSON response.
+    Extract clean JSON from LLM response.
+    Handles cases where thinking models prefix output with <think>...</think> tags.
+    """
+    # Strip thinking tags if present (qwen3 may include them)
+    if "<think>" in text:
+        think_end = text.rfind("</think>")
+        if think_end != -1:
+            text = text[think_end + len("</think>"):].strip()
+    
+    # Strip markdown code fences if the model wraps JSON in ```json ... ```
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first line (```json) and last line (```)
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    
+    return text
+
+
+async def call_llm(
+    system_prompt: str, 
+    user_prompt: str, 
+    response_schema=None
+) -> dict:
+    """
+    Call Groq API (qwen/qwen3-32b) and return parsed JSON response.
+    
+    Uses JSON mode for guaranteed valid JSON. When a Pydantic response_schema
+    is provided, its JSON schema is injected into the system prompt to guide
+    the output structure.
     
     Args:
-        system_prompt: Instructions for the model
+        system_prompt: Instructions for the model (system message)
         user_prompt: The actual query/task
+        response_schema: Optional Pydantic model class — its JSON schema is 
+                         injected into the prompt to guide output structure
         
     Returns:
-        Parsed JSON response from Gemini
+        Parsed JSON response as dict
+        
+    Raises:
+        RuntimeError: If API key not set or rate limit exceeded
+        ValueError: If response cannot be parsed as JSON
     """
-    model = get_gemini_model()
-    if model is None:
-        raise RuntimeError("GEMINI_API_KEY environment variable not set")
+    # #region agent log
+    open(r'c:\Users\bring\Desktop\loan_app\.cursor\debug.log','a').write(json.dumps({"hypothesisId":"H3","location":"llm_analyzer.py:call_llm:entry","message":"call_llm entered","data":{"prompt_len":len(user_prompt),"has_schema":response_schema is not None},"timestamp":__import__('time').time()})+'\n')
+    # #endregion
+    client = _get_groq_client()
+    # #region agent log
+    open(r'c:\Users\bring\Desktop\loan_app\.cursor\debug.log','a').write(json.dumps({"hypothesisId":"H3","location":"llm_analyzer.py:call_llm:after_client","message":"AsyncGroq client created successfully","data":{},"timestamp":__import__('time').time()})+'\n')
+    # #endregion
     
-    # Combine system and user prompts (Gemini handles this differently)
-    full_prompt = f"""{system_prompt}
-
----
-
-{user_prompt}"""
+    # If schema provided, inject its JSON schema into the system prompt
+    effective_system_prompt = system_prompt
+    if response_schema:
+        schema_json = json.dumps(response_schema.model_json_schema(), indent=2)
+        effective_system_prompt += (
+            "\n\nYou MUST respond with valid JSON matching this exact schema:\n"
+            f"{schema_json}\n"
+            "Do NOT include any text outside the JSON object."
+        )
     
-    # Gemini's generate_content is synchronous, wrap for async compatibility
-    import asyncio
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None, 
-        lambda: model.generate_content(full_prompt)
-    )
+    messages = [
+        {"role": "system", "content": effective_system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
     
-    # Parse JSON response
     try:
-        return json.loads(response.text)
-    except json.JSONDecodeError:
-        # Try to extract JSON from response if it has extra text
-        text = response.text
-        start = text.find('{')
-        end = text.rfind('}') + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
-        raise ValueError(f"Could not parse JSON from response: {text[:200]}")
-
-
-# ==========================================================================
-# PYDANTIC-STYLE RESPONSE SCHEMA FOR LLM
-# ==========================================================================
-
-SUMMARY_EXTRACTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "document_type": {
-            "type": "string",
-            "description": "Type of loan document (e.g., Personal Loan Agreement, Mortgage, Auto Loan)"
-        },
-        "overview": {
-            "type": "string", 
-            "description": "2-3 sentence plain English summary of the loan for a non-expert"
-        },
-        "key_numbers": {
-            "type": "object",
-            "properties": {
-                "total_loan": {"type": "number", "description": "Principal loan amount"},
-                "interest_rate": {"type": "number", "description": "Annual interest rate as percentage"},
-                "term_months": {"type": "integer", "description": "Loan term in months"},
-                "monthly_payment": {"type": ["number", "null"], "description": "Monthly payment if stated, otherwise null"},
-                "fees": {"type": ["number", "null"], "description": "Total fees if found, otherwise null"}
-            },
-            "required": ["total_loan", "interest_rate", "term_months"]
-        },
-        "highlights": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "type": {"type": "string", "enum": ["positive", "negative", "warning"]},
-                    "text": {"type": "string", "description": "Short highlight statement"}
-                },
-                "required": ["type", "text"]
-            },
-            "description": "3-5 key highlights about the loan terms"
-        },
-        "confidence": {
-            "type": "object",
-            "properties": {
-                "loan_amount": {"type": "string", "enum": ["high", "medium", "low"]},
-                "interest_rate": {"type": "string", "enum": ["high", "medium", "low"]},
-                "term": {"type": "string", "enum": ["high", "medium", "low"]}
-            },
-            "description": "Confidence levels for extracted values"
-        }
-    },
-    "required": ["document_type", "overview", "key_numbers", "highlights", "confidence"]
-}
+        print(f"DEBUG: Calling Groq API (qwen/qwen3-32b) with prompt length: {len(user_prompt)} chars", flush=True)
+        # #region agent log
+        open(r'c:\Users\bring\Desktop\loan_app\.cursor\debug.log','a').write(json.dumps({"hypothesisId":"H4","location":"llm_analyzer.py:call_llm:before_api_call","message":"About to call Groq API","data":{"model":"qwen/qwen3-32b","msg_count":len(messages),"sys_prompt_len":len(effective_system_prompt)},"timestamp":__import__('time').time()})+'\n')
+        # #endregion
+        
+        # Native async call — no run_in_executor needed with AsyncGroq
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="qwen/qwen3-32b",
+                messages=messages,
+                temperature=0.1,
+                max_completion_tokens=8192,
+                top_p=0.95,
+                # NOTE: response_format=json_object is NOT used here because
+                # Qwen3 is a "thinking" model that may emit <think> tags before
+                # the JSON, which breaks json_object enforcement. We handle
+                # JSON extraction manually via _extract_json_from_response.
+                stream=False,
+            ),
+            timeout=120.0
+        )
+        
+        print(f"DEBUG: Groq API call completed successfully", flush=True)
+    except asyncio.TimeoutError:
+        print("ERROR: Groq API call timed out after 120 seconds", flush=True)
+        raise RuntimeError(
+            "Groq API call timed out after 120 seconds. "
+            "The document may be too large or the API is slow. "
+            "Try again or use a smaller document."
+        )
+    except Exception as e:
+        error_str = str(e)
+        print(f"ERROR: Groq API call failed: {error_str[:500]}", flush=True)
+        # Check for rate limit errors
+        if "rate_limit" in error_str.lower() or "429" in error_str:
+            raise RuntimeError(
+                "Groq API rate limit exceeded. "
+                "Please wait and try again. Error: " + error_str[:200]
+            )
+        raise
+    
+    # Extract the response text
+    text = response.choices[0].message.content.strip()
+    
+    # Clean up any thinking tags or code fences
+    text = _extract_json_from_response(text)
+    
+    print(f"DEBUG: Groq response length: {len(text)} chars", flush=True)
+    if len(text) < 2000:
+        print(f"DEBUG: Full response: {text}", flush=True)
+    else:
+        print(f"DEBUG: Response preview (first 500): {text[:500]}", flush=True)
+    
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: JSON parse failed: {e}", flush=True)
+        print(f"DEBUG: Response text: {text[:1000]}", flush=True)
+        raise ValueError(f"Could not parse JSON from response. Error: {e}")
 
 
 # ==========================================================================
@@ -158,17 +268,120 @@ Your task is to extract key numbers and generate a summary for non-expert borrow
 
 IMPORTANT GUIDELINES:
 1. Use the provided numeric candidates as reference - they were extracted via regex and may contain false positives
-2. Verify values by checking the context around each candidate
-3. If multiple candidates exist for the same field, pick the one that appears in the most authoritative context
-4. If a value is not clearly stated, use null rather than guessing
-5. Generate highlights that help a borrower understand the implications of this loan
-6. Compare values against typical industry standards when assessing positive/negative/warning
+2. If NO candidates are provided (all lists are empty), you MUST extract values directly from the document text
+3. Search the entire document text for loan amount, interest rate, and loan term - they may be in tables, different sections, or use different terminology
+4. Verify values by checking the context around each candidate or finding
+5. If multiple candidates exist for the same field, pick the one that appears in the most authoritative context
+6. Look for variations like: "Loan Amount/Limit", "Rate Interest", "EMI period", "tenure", "disbursement amount"
+7. For interest rates, look for patterns like "X% p.a.", "X% per annum", "X% compounded monthly"
+8. If a value is not clearly stated, use null rather than guessing
+9. Generate highlights that help a borrower understand the implications of this loan
+10. Compare values against typical industry standards when assessing positive/negative/warning
+
+CRITICAL: Even if regex found nothing, you MUST extract the required fields (total_loan, interest_rate, term_months) from the document text. Do not return null for all three required fields unless the document truly contains no loan information.
 
 For highlights:
 - "positive": Fixed rates, no prepayment penalty, reasonable fees
 - "negative": High interest rates (>10% for personal loans), large fees, strict terms
 - "warning": Prepayment penalties, variable rates, balloon payments, arbitration clauses"""
 
+
+RED_FLAGS_SYSTEM_PROMPT = """You are a consumer protection analyst specializing in loan agreements.
+Your task is to identify RED FLAGS - terms that are unfavorable, unusual, or potentially harmful to the borrower.
+
+WHAT TO LOOK FOR:
+1. **High Fees**: Origination fees > 3%, late fees > $50, excessive processing charges
+2. **Penalty Clauses**: Prepayment penalties, acceleration clauses, cross-default provisions
+3. **Interest Issues**: Rates above market (>15% for personal loans), variable rates without caps, compound interest
+4. **Hidden Costs**: Mandatory insurance, balloon payments, fee escalation clauses
+5. **Legal Concerns**: Mandatory arbitration, waiver of rights, confession of judgment
+6. **Unfair Terms**: Unilateral modification rights, automatic renewal, excessive collateral requirements
+
+SEVERITY GUIDELINES:
+- "high": Could cost borrower significant money or rights (prepayment penalties, arbitration clauses, very high rates)
+- "medium": Above normal but not extreme (moderately high fees, long terms, variable rates)
+- "low": Minor concerns worth noting (standard but notable clauses, slight deviations from best practices)
+
+IMPORTANT:
+- Be specific about WHY something is a red flag
+- Compare against industry standards when possible
+- Provide actionable recommendations
+- Include page numbers and section references
+- If no red flags found, return an empty array"""
+
+
+HIDDEN_CLAUSES_SYSTEM_PROMPT = """You are a legal document analyst specializing in making loan agreements understandable to everyday people.
+Your task is to find HIDDEN CLAUSES - legal language that is buried, complex, or easy to miss that could affect the borrower.
+
+WHAT TO LOOK FOR:
+1. **Prepayment Terms**: Early payoff penalties, yield maintenance clauses
+2. **Default Provisions**: Cross-default, acceleration clauses, cure periods
+3. **Arbitration Clauses**: Mandatory arbitration, class action waivers
+4. **Fee Escalation**: Late fee compounding, rate increase triggers
+5. **Insurance Requirements**: Forced-place insurance, life insurance requirements
+6. **Collateral Provisions**: Cross-collateralization, after-acquired property
+7. **Modification Rights**: Lender's right to change terms unilaterally
+8. **Liability Waivers**: Borrower waiving certain legal rights
+
+IMPORTANT GUIDELINES:
+1. Extract the ACTUAL text from the document (abbreviate long passages with ...)
+2. Translate complex legal language into simple, plain English
+3. Explain the REAL-WORLD impact on the borrower
+4. Focus on clauses that are easy to miss or hard to understand
+5. Include specific page and section references
+
+IMPACT LEVELS:
+- "high": Could significantly affect borrower's finances or rights
+- "medium": Important to understand but manageable
+- "low": Good to know but minor impact
+
+If no hidden clauses are found, return an empty array."""
+
+
+FINANCIAL_TERMS_SYSTEM_PROMPT = """You are a financial educator specializing in making loan documents understandable.
+Your task is to identify FINANCIAL TERMS that borrowers might not understand and explain them in plain English.
+
+WHAT TO LOOK FOR:
+1. **Common Loan Terms**: APR, Principal, Interest Rate, EMI, MCLR, Tenure, Collateral
+2. **Fees & Charges**: Processing Fee, Origination Fee, Late Fee, Prepayment Penalty
+3. **Legal Terms**: Default, Acceleration, Arbitration, Foreclosure, Lien
+4. **Payment Terms**: Amortization, Balloon Payment, Grace Period, Moratorium
+5. **Rate Types**: Fixed Rate, Variable Rate, Floating Rate, Prime Rate
+
+IMPORTANT GUIDELINES:
+1. Only extract THE MOST IMPORTANT 5-8 terms that actually appear in THIS document
+2. Prioritize terms that are most confusing or impactful to borrowers
+3. Keep short_description under 15 words
+4. Keep definition under 30 words - be concise!
+5. Keep example text under 25 words
+6. Use appropriate icons: lightbulb for informational, warning for cautions, checkmark for positive
+
+If no financial terms are found, return an empty array."""
+
+
+CHAT_SYSTEM_PROMPT = """You are a helpful assistant that answers questions about loan documents.
+Your role is to help borrowers understand their loan agreement by answering questions in plain, clear language.
+
+IMPORTANT GUIDELINES:
+1. Answer questions based ONLY on the document text provided
+2. If information is not in the document, say so clearly
+3. Use simple, non-technical language that anyone can understand
+4. When referencing specific clauses, include page numbers and section names
+5. Provide examples using actual values from the document when relevant
+6. Be helpful and empathetic - borrowers may be confused or concerned
+7. If asked about something that could be a problem (like penalties), explain it clearly
+8. Reference related clauses by their IDs if they were previously identified (e.g., hc_001, rf_001)
+
+TONE:
+- Friendly and approachable
+- Clear and direct
+- Supportive (this is a financial decision, people may be stressed)
+- Non-judgmental"""
+
+
+# ==========================================================================
+# PROMPT BUILDERS
+# ==========================================================================
 
 def build_summary_prompt(llm_input: dict) -> str:
     """Build the user prompt for summary extraction."""
@@ -208,28 +421,42 @@ def build_summary_prompt(llm_input: dict) -> str:
             candidates_text.append(f"  - ${c['value']:,.2f} (page {c['page']})")
             candidates_text.append(f"    Context: \"{c['context']}\"")
     
-    candidates_section = "\n".join(candidates_text) if candidates_text else "No numeric candidates found via regex - extract from document text directly."
+    candidates_section = "\n".join(candidates_text) if candidates_text else "No numeric candidates found via regex - YOU MUST extract values directly from the document text below."
+    
+    # Add emphasis if no candidates found
+    extraction_instruction = ""
+    if not candidates_text:
+        extraction_instruction = """
+IMPORTANT: No regex candidates were found. You MUST extract the required values (total_loan, interest_rate, term_months) directly from the document text.
+Look carefully through the entire document text for:
+- Loan amount (may be labeled as "Loan Amount", "Loan Amount/Limit", "Principal", "Sanctioned Amount", etc.)
+- Interest rate (may be labeled as "Rate of Interest", "Interest Rate", "Rate Interest", "% p.a.", etc.)
+- Loan term (may be labeled as "Term", "Tenure", "EMI Period", "Repayment Period", "Duration", etc.)
+Even if the format is unusual or in a table, extract the values."""
     
     return f"""Analyze this loan document and extract the key numbers.
 
 === EXTRACTED NUMERIC CANDIDATES ===
 {candidates_section}
+{extraction_instruction}
 
 === FULL DOCUMENT TEXT ===
 {llm_input["document_text"]}
 
 === TASK ===
-1. Review the candidates and document text
-2. Select the correct values for: loan amount, interest rate, term
-3. Note monthly payment if explicitly stated (don't calculate yet)
-4. Generate an overview and highlights for a borrower
-5. Assess your confidence in each extracted value
+1. Carefully read the ENTIRE document text above
+2. Extract the required values: loan amount, interest rate, and loan term
+3. Look for these values even if they're in tables, different sections, or use alternative terminology
+4. If you find the values, return them as numbers (not null)
+5. Note monthly payment if explicitly stated (don't calculate yet)
+6. Generate an overview and highlights for a borrower
+7. Assess your confidence in each extracted value
 
-Return your analysis as JSON matching the required schema."""
+You must extract at least loan amount, interest rate, and term_months from the document. Do not return null for all three unless the document truly contains no loan information."""
 
 
 # ==========================================================================
-# MAIN ANALYSIS FUNCTION
+# MAIN ANALYSIS FUNCTIONS
 # ==========================================================================
 
 async def analyze_for_summary(extraction: PDFExtraction, extractor) -> dict:
@@ -244,48 +471,57 @@ async def analyze_for_summary(extraction: PDFExtraction, extractor) -> dict:
         Complete summary response matching API_DESIGN.md schema
         
     Raises:
-        RuntimeError: If GEMINI_API_KEY is not set
+        RuntimeError: If GROQ_API_KEY is not set
     """
     # Prepare data for LLM
     llm_input = extractor.prepare_for_llm(extraction)
     
-    # Build prompt with JSON schema instruction
-    user_prompt = build_summary_prompt(llm_input) + f"""
-
-Return your response as a JSON object with this exact structure:
-{{
-    "document_type": "string - type of loan",
-    "overview": "string - 2-3 sentence summary",
-    "key_numbers": {{
-        "total_loan": number,
-        "interest_rate": number,
-        "term_months": integer,
-        "monthly_payment": number or null,
-        "fees": number or null
-    }},
-    "highlights": [
-        {{"type": "positive|negative|warning", "text": "string"}}
-    ],
-    "confidence": {{
-        "loan_amount": "high|medium|low",
-        "interest_rate": "high|medium|low",
-        "term": "high|medium|low"
-    }}
-}}"""
+    # Build prompt (no JSON formatting instructions needed - schema handles it)
+    user_prompt = build_summary_prompt(llm_input)
     
-    # Call Gemini
-    llm_result = await call_gemini(SUMMARY_SYSTEM_PROMPT, user_prompt)
+    # Call LLM with structured output schema
+    llm_result = await call_llm(
+        SUMMARY_SYSTEM_PROMPT, 
+        user_prompt, 
+        response_schema=SummaryExtractionResponse
+    )
     
     # Calculate derived values if not provided by document
-    key_numbers = llm_result["key_numbers"]
+    key_numbers = llm_result.get("key_numbers", {})
+    
+    # Validate required fields are not None
+    total_loan = key_numbers.get("total_loan")
+    interest_rate = key_numbers.get("interest_rate")
+    term_months = key_numbers.get("term_months")
+    
+    if total_loan is None or interest_rate is None or term_months is None:
+        # Log what candidates were available to help debug
+        candidates_info = {
+            "loan_amounts": len(llm_input["candidates"]["loan_amounts"]),
+            "interest_rates": len(llm_input["candidates"]["interest_rates"]),
+            "term_months": len(llm_input["candidates"]["term_months"]),
+        }
+        print(f"LLM extraction failed. Available candidates: {candidates_info}", flush=True)
+        print(f"LLM returned key_numbers: {key_numbers}", flush=True)
+        print(f"Full LLM response keys: {list(llm_result.keys())}", flush=True)
+        
+        # LLM didn't extract required fields, raise error to trigger fallback
+        raise ValueError(
+            f"LLM failed to extract required fields: "
+            f"total_loan={total_loan}, interest_rate={interest_rate}, term_months={term_months}. "
+            f"Candidates available: {candidates_info}"
+        )
+    
+    # Ensure term_months is an integer
+    term_months = int(term_months)
     
     # Calculate monthly payment if not in document
     if key_numbers.get("monthly_payment") is None:
         key_numbers["monthly_payment"] = round(
             calculate_monthly_payment(
-                key_numbers["total_loan"],
-                key_numbers["interest_rate"],
-                key_numbers["term_months"]
+                total_loan,
+                interest_rate,
+                term_months
             ), 
             2
         )
@@ -293,9 +529,9 @@ Return your response as a JSON object with this exact structure:
     # Always calculate total interest
     key_numbers["total_interest"] = round(
         calculate_total_interest(
-            key_numbers["total_loan"],
+            total_loan,
             key_numbers["monthly_payment"],
-            key_numbers["term_months"]
+            term_months
         ),
         2
     )
@@ -316,6 +552,160 @@ Return your response as a JSON object with this exact structure:
     }
 
 
+async def analyze_for_red_flags(extraction: PDFExtraction, extractor) -> dict:
+    """
+    Use LLM to analyze document for red flags.
+    
+    Args:
+        extraction: PDFExtraction from pdf_extractor
+        extractor: PDFExtractor instance
+        
+    Returns:
+        Dict with red flags list matching API_DESIGN.md schema
+    """
+    llm_input = extractor.prepare_for_llm(extraction)
+    
+    # Simplified prompt - no JSON formatting rules needed, schema handles it
+    prompt = f"""Analyze this loan document for red flags - terms that are unfavorable or potentially harmful to the borrower.
+
+=== DOCUMENT TEXT ===
+{llm_input["document_text"]}
+
+=== TASK ===
+1. Carefully read the entire document
+2. Identify any terms that are unfavorable to the borrower
+3. Compare fees, rates, and terms against industry standards
+4. For each red flag, provide severity, a clear title, why it's problematic, the page and section location, and actionable recommendation
+
+If no red flags are found, return an empty list."""
+
+    result = await call_llm(
+        RED_FLAGS_SYSTEM_PROMPT, 
+        prompt, 
+        response_schema=RedFlagsLLMResponse
+    )
+    
+    # Add IDs to each red flag
+    red_flags = []
+    for i, flag in enumerate(result["red_flags"], start=1):
+        red_flags.append({
+            "id": f"rf_{i:03d}",
+            "severity": flag["severity"],
+            "title": flag["title"],
+            "description": flag["description"],
+            "location": flag["location"],
+            "recommendation": flag["recommendation"]
+        })
+    
+    return {
+        "count": len(red_flags),
+        "data": red_flags
+    }
+
+
+async def analyze_for_hidden_clauses(extraction: PDFExtraction, extractor) -> dict:
+    """
+    Use LLM to find hidden or complex clauses in the document.
+    
+    Args:
+        extraction: PDFExtraction from pdf_extractor
+        extractor: PDFExtractor instance
+        
+    Returns:
+        Dict with hidden clauses list matching API_DESIGN.md schema
+    """
+    llm_input = extractor.prepare_for_llm(extraction)
+    
+    # Simplified prompt - no JSON formatting rules needed, schema handles it
+    prompt = f"""Analyze this loan document for hidden clauses - complex legal language that borrowers might miss or not understand.
+
+=== DOCUMENT TEXT ===
+{llm_input["document_text"]}
+
+=== TASK ===
+1. Carefully read the entire document
+2. Identify clauses that are written in complex legal language, buried in dense paragraphs, easy to overlook, or could have significant impact on the borrower
+3. For each hidden clause, provide the category, a clear title, one-line summary, the original text from the document (abbreviate with ... if long), a plain English translation, impact level, and page/section location
+
+If no hidden clauses are found, return an empty list."""
+
+    result = await call_llm(
+        HIDDEN_CLAUSES_SYSTEM_PROMPT, 
+        prompt, 
+        response_schema=HiddenClausesLLMResponse
+    )
+    
+    # Add IDs to each hidden clause
+    hidden_clauses = []
+    for i, clause in enumerate(result["hidden_clauses"], start=1):
+        hidden_clauses.append({
+            "id": f"hc_{i:03d}",
+            "category": clause["category"],
+            "title": clause["title"],
+            "summary": clause["summary"],
+            "original_text": clause["original_text"],
+            "plain_english": clause["plain_english"],
+            "impact": clause["impact"],
+            "location": clause["location"]
+        })
+    
+    return {
+        "count": len(hidden_clauses),
+        "data": hidden_clauses
+    }
+
+
+async def analyze_for_financial_terms(extraction: PDFExtraction, extractor) -> dict:
+    """
+    Use LLM to extract and explain financial terms from the document.
+    
+    Args:
+        extraction: PDFExtraction from pdf_extractor
+        extractor: PDFExtractor instance
+        
+    Returns:
+        Dict with financial terms list matching API_DESIGN.md schema
+    """
+    llm_input = extractor.prepare_for_llm(extraction)
+    
+    # Simplified prompt - no JSON formatting rules needed, schema handles it
+    prompt = f"""Analyze this loan document and extract the 5-8 MOST IMPORTANT financial/legal terms that need explanation.
+
+=== DOCUMENT TEXT ===
+{llm_input["document_text"]}
+
+=== TASK ===
+1. Scan the document for financial terminology
+2. Identify the 5-8 MOST IMPORTANT terms that borrowers might not understand
+3. For each term, provide the term name as it appears, full expanded name, a concise one-line summary, plain English definition, a contextual example using actual values from THIS document, the actual value from the document, and page/section location
+4. Limit to 5-8 most important terms only. Keep all text fields brief."""
+
+    result = await call_llm(
+        FINANCIAL_TERMS_SYSTEM_PROMPT, 
+        prompt, 
+        response_schema=FinancialTermsLLMResponse
+    )
+    
+    # Add IDs to each term
+    terms = []
+    for i, term in enumerate(result["terms"], start=1):
+        terms.append({
+            "id": f"term_{i:03d}",
+            "name": term["name"],
+            "full_name": term["full_name"],
+            "short_description": term["short_description"],
+            "definition": term["definition"],
+            "example": term["example"],
+            "your_value": term["your_value"],
+            "location": term["location"]
+        })
+    
+    return {
+        "count": len(terms),
+        "terms": terms
+    }
+
+
 # ==========================================================================
 # FALLBACK: PURE REGEX-BASED SUMMARY (NO LLM)
 # ==========================================================================
@@ -331,6 +721,28 @@ def generate_summary_from_regex_only(extraction: PDFExtraction) -> Optional[dict
     
     # Need at least loan amount, rate, and term
     if not (candidates.loan_amounts and candidates.interest_rates and candidates.term_months):
+        # Provide diagnostic information about what was found
+        found = []
+        if candidates.loan_amounts:
+            found.append(f"{len(candidates.loan_amounts)} loan amount(s)")
+        if candidates.interest_rates:
+            found.append(f"{len(candidates.interest_rates)} interest rate(s)")
+        if candidates.term_months:
+            found.append(f"{len(candidates.term_months)} term(s)")
+        if candidates.monthly_payments:
+            found.append(f"{len(candidates.monthly_payments)} monthly payment(s)")
+        if candidates.fees:
+            found.append(f"{len(candidates.fees)} fee(s)")
+        
+        missing = []
+        if not candidates.loan_amounts:
+            missing.append("loan amount")
+        if not candidates.interest_rates:
+            missing.append("interest rate")
+        if not candidates.term_months:
+            missing.append("loan term")
+        
+        print(f"Regex extraction insufficient: Found {', '.join(found) if found else 'nothing'}. Missing: {', '.join(missing)}", flush=True)
         return None
     
     # Take first (highest confidence) candidate for each
@@ -379,141 +791,6 @@ def generate_summary_from_regex_only(extraction: PDFExtraction) -> Optional[dict
             "source": "regex_only",
             "confidence": "low"
         }
-    }
-
-
-# ==========================================================================
-# RED FLAGS ANALYSIS
-# ==========================================================================
-
-RED_FLAGS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "red_flags": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "severity": {
-                        "type": "string",
-                        "enum": ["high", "medium", "low"],
-                        "description": "Severity based on financial impact to borrower"
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Short, clear title for the red flag"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Explanation of why this is problematic for the borrower"
-                    },
-                    "location": {
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer"},
-                            "section": {"type": "string"}
-                        },
-                        "required": ["page", "section"]
-                    },
-                    "recommendation": {
-                        "type": "string",
-                        "description": "Specific, actionable advice for the borrower"
-                    }
-                },
-                "required": ["severity", "title", "description", "location", "recommendation"]
-            },
-            "description": "List of red flags found in the document"
-        }
-    },
-    "required": ["red_flags"]
-}
-
-
-RED_FLAGS_SYSTEM_PROMPT = """You are a consumer protection analyst specializing in loan agreements.
-Your task is to identify RED FLAGS - terms that are unfavorable, unusual, or potentially harmful to the borrower.
-
-WHAT TO LOOK FOR:
-1. **High Fees**: Origination fees > 3%, late fees > $50, excessive processing charges
-2. **Penalty Clauses**: Prepayment penalties, acceleration clauses, cross-default provisions
-3. **Interest Issues**: Rates above market (>15% for personal loans), variable rates without caps, compound interest
-4. **Hidden Costs**: Mandatory insurance, balloon payments, fee escalation clauses
-5. **Legal Concerns**: Mandatory arbitration, waiver of rights, confession of judgment
-6. **Unfair Terms**: Unilateral modification rights, automatic renewal, excessive collateral requirements
-
-SEVERITY GUIDELINES:
-- "high": Could cost borrower significant money or rights (prepayment penalties, arbitration clauses, very high rates)
-- "medium": Above normal but not extreme (moderately high fees, long terms, variable rates)
-- "low": Minor concerns worth noting (standard but notable clauses, slight deviations from best practices)
-
-IMPORTANT:
-- Be specific about WHY something is a red flag
-- Compare against industry standards when possible
-- Provide actionable recommendations
-- Include page numbers and section references
-- If no red flags found, return an empty array"""
-
-
-async def analyze_for_red_flags(extraction: PDFExtraction, extractor) -> dict:
-    """
-    Use LLM to analyze document for red flags.
-    
-    Args:
-        extraction: PDFExtraction from pdf_extractor
-        extractor: PDFExtractor instance
-        
-    Returns:
-        Dict with red flags list matching API_DESIGN.md schema
-    """
-    llm_input = extractor.prepare_for_llm(extraction)
-    
-    prompt = f"""Analyze this loan document for red flags - terms that are unfavorable or potentially harmful to the borrower.
-
-=== DOCUMENT TEXT ===
-{llm_input["document_text"]}
-
-=== TASK ===
-1. Carefully read the entire document
-2. Identify any terms that are unfavorable to the borrower
-3. Compare fees, rates, and terms against industry standards
-4. For each red flag, provide:
-   - Severity (high/medium/low)
-   - Clear title
-   - Why it's problematic
-   - Specific page and section location
-   - Actionable recommendation
-
-Return your response as a JSON object with this exact structure:
-{{
-    "red_flags": [
-        {{
-            "severity": "high|medium|low",
-            "title": "string",
-            "description": "string - why this is problematic",
-            "location": {{"page": integer, "section": "string"}},
-            "recommendation": "string - actionable advice"
-        }}
-    ]
-}}
-
-If no red flags are found, return {{"red_flags": []}}"""
-
-    result = await call_gemini(RED_FLAGS_SYSTEM_PROMPT, prompt)
-    
-    # Add IDs to each red flag
-    red_flags = []
-    for i, flag in enumerate(result["red_flags"], start=1):
-        red_flags.append({
-            "id": f"rf_{i:03d}",
-            "severity": flag["severity"],
-            "title": flag["title"],
-            "description": flag["description"],
-            "location": flag["location"],
-            "recommendation": flag["recommendation"]
-        })
-    
-    return {
-        "count": len(red_flags),
-        "data": red_flags
     }
 
 
@@ -573,169 +850,13 @@ def generate_red_flags_from_regex_only(extraction: PDFExtraction) -> dict:
             "title": "Limited Analysis Available",
             "description": "Full AI analysis unavailable. Manual review recommended.",
             "location": {"page": 1, "section": "General"},
-            "recommendation": "Set GEMINI_API_KEY for comprehensive red flag detection."
+            "recommendation": "Set GROQ_API_KEY for comprehensive red flag detection."
         })
     
     return {
         "count": len(red_flags),
         "data": red_flags,
         "_meta": {"source": "regex_only"}
-    }
-
-
-# ==========================================================================
-# HIDDEN CLAUSES ANALYSIS
-# ==========================================================================
-
-HIDDEN_CLAUSES_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "hidden_clauses": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "description": "Category: prepayment, arbitration, fees, liability, default, insurance, modification, etc."
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Short, clear title for the clause"
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "One-line summary of what this clause means"
-                    },
-                    "original_text": {
-                        "type": "string",
-                        "description": "Exact text extracted from the document (can be abbreviated with ...)"
-                    },
-                    "plain_english": {
-                        "type": "string",
-                        "description": "Translation to simple, plain English that anyone can understand"
-                    },
-                    "impact": {
-                        "type": "string",
-                        "enum": ["high", "medium", "low"],
-                        "description": "Impact level on the borrower"
-                    },
-                    "location": {
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer"},
-                            "section": {"type": "string"}
-                        },
-                        "required": ["page", "section"]
-                    }
-                },
-                "required": ["category", "title", "summary", "original_text", "plain_english", "impact", "location"]
-            },
-            "description": "List of hidden or complex clauses found in the document"
-        }
-    },
-    "required": ["hidden_clauses"]
-}
-
-
-HIDDEN_CLAUSES_SYSTEM_PROMPT = """You are a legal document analyst specializing in making loan agreements understandable to everyday people.
-Your task is to find HIDDEN CLAUSES - legal language that is buried, complex, or easy to miss that could affect the borrower.
-
-WHAT TO LOOK FOR:
-1. **Prepayment Terms**: Early payoff penalties, yield maintenance clauses
-2. **Default Provisions**: Cross-default, acceleration clauses, cure periods
-3. **Arbitration Clauses**: Mandatory arbitration, class action waivers
-4. **Fee Escalation**: Late fee compounding, rate increase triggers
-5. **Insurance Requirements**: Forced-place insurance, life insurance requirements
-6. **Collateral Provisions**: Cross-collateralization, after-acquired property
-7. **Modification Rights**: Lender's right to change terms unilaterally
-8. **Liability Waivers**: Borrower waiving certain legal rights
-
-IMPORTANT GUIDELINES:
-1. Extract the ACTUAL text from the document (abbreviate long passages with ...)
-2. Translate complex legal language into simple, plain English
-3. Explain the REAL-WORLD impact on the borrower
-4. Focus on clauses that are easy to miss or hard to understand
-5. Include specific page and section references
-
-IMPACT LEVELS:
-- "high": Could significantly affect borrower's finances or rights
-- "medium": Important to understand but manageable
-- "low": Good to know but minor impact
-
-If no hidden clauses are found, return an empty array."""
-
-
-async def analyze_for_hidden_clauses(extraction: PDFExtraction, extractor) -> dict:
-    """
-    Use LLM to find hidden or complex clauses in the document.
-    
-    Args:
-        extraction: PDFExtraction from pdf_extractor
-        extractor: PDFExtractor instance
-        
-    Returns:
-        Dict with hidden clauses list matching API_DESIGN.md schema
-    """
-    llm_input = extractor.prepare_for_llm(extraction)
-    
-    prompt = f"""Analyze this loan document for hidden clauses - complex legal language that borrowers might miss or not understand.
-
-=== DOCUMENT TEXT ===
-{llm_input["document_text"]}
-
-=== TASK ===
-1. Carefully read the entire document
-2. Identify clauses that are:
-   - Written in complex legal language
-   - Buried in dense paragraphs
-   - Easy to overlook
-   - Could have significant impact on the borrower
-3. For each hidden clause, provide:
-   - Category (prepayment, arbitration, fees, etc.)
-   - Clear title
-   - One-line summary
-   - The original text from the document
-   - Plain English translation
-   - Impact level (high/medium/low)
-   - Page and section location
-
-Return your response as a JSON object with this exact structure:
-{{
-    "hidden_clauses": [
-        {{
-            "category": "string - prepayment, arbitration, fees, liability, default, insurance, modification, etc.",
-            "title": "string",
-            "summary": "string - one-line summary",
-            "original_text": "string - exact text from document",
-            "plain_english": "string - simple translation",
-            "impact": "high|medium|low",
-            "location": {{"page": integer, "section": "string"}}
-        }}
-    ]
-}}
-
-If no hidden clauses are found, return {{"hidden_clauses": []}}"""
-
-    result = await call_gemini(HIDDEN_CLAUSES_SYSTEM_PROMPT, prompt)
-    
-    # Add IDs to each hidden clause
-    hidden_clauses = []
-    for i, clause in enumerate(result["hidden_clauses"], start=1):
-        hidden_clauses.append({
-            "id": f"hc_{i:03d}",
-            "category": clause["category"],
-            "title": clause["title"],
-            "summary": clause["summary"],
-            "original_text": clause["original_text"],
-            "plain_english": clause["plain_english"],
-            "impact": clause["impact"],
-            "location": clause["location"]
-        })
-    
-    return {
-        "count": len(hidden_clauses),
-        "data": hidden_clauses
     }
 
 
@@ -754,172 +875,11 @@ def generate_hidden_clauses_from_regex_only(extraction: PDFExtraction) -> dict:
             "title": "Full Analysis Unavailable",
             "summary": "AI-powered clause detection requires API key.",
             "original_text": "Document text available but not analyzed.",
-            "plain_english": "To find hidden clauses in your loan document, please enable AI analysis by setting the GEMINI_API_KEY.",
+            "plain_english": "To find hidden clauses in your loan document, please enable AI analysis by setting the GROQ_API_KEY.",
             "impact": "low",
             "location": {"page": 1, "section": "General"}
         }],
         "_meta": {"source": "regex_only"}
-    }
-
-
-# ==========================================================================
-# FINANCIAL TERMS ANALYSIS
-# ==========================================================================
-
-FINANCIAL_TERMS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "terms": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Term name (e.g., APR, MCLR, EMI, Principal)"
-                    },
-                    "full_name": {
-                        "type": "string",
-                        "description": "Expanded name if abbreviated (e.g., Annual Percentage Rate)"
-                    },
-                    "short_description": {
-                        "type": "string",
-                        "description": "One-line summary of what this term means"
-                    },
-                    "definition": {
-                        "type": "string",
-                        "description": "Plain English explanation for a non-expert borrower"
-                    },
-                    "example": {
-                        "type": "object",
-                        "properties": {
-                            "icon": {"type": "string", "enum": ["💡", "⚠️", "✅"]},
-                            "title": {"type": "string"},
-                            "text": {"type": "string", "description": "Example using actual values from this document"}
-                        },
-                        "required": ["icon", "title", "text"]
-                    },
-                    "your_value": {
-                        "type": "string",
-                        "description": "The actual value of this term in the document (e.g., '13.2%', '$500', '60 months')"
-                    },
-                    "location": {
-                        "type": "object",
-                        "properties": {
-                            "page": {"type": "integer"},
-                            "section": {"type": "string"}
-                        },
-                        "required": ["page", "section"]
-                    }
-                },
-                "required": ["name", "full_name", "short_description", "definition", "example", "your_value", "location"]
-            },
-            "description": "List of financial terms found in the document"
-        }
-    },
-    "required": ["terms"]
-}
-
-
-FINANCIAL_TERMS_SYSTEM_PROMPT = """You are a financial educator specializing in making loan documents understandable.
-Your task is to identify FINANCIAL TERMS that borrowers might not understand and explain them in plain English.
-
-WHAT TO LOOK FOR:
-1. **Common Loan Terms**: APR, Principal, Interest Rate, EMI, MCLR, Tenure, Collateral
-2. **Fees & Charges**: Processing Fee, Origination Fee, Late Fee, Prepayment Penalty
-3. **Legal Terms**: Default, Acceleration, Arbitration, Foreclosure, Lien
-4. **Payment Terms**: Amortization, Balloon Payment, Grace Period, Moratorium
-5. **Rate Types**: Fixed Rate, Variable Rate, Floating Rate, Prime Rate
-
-IMPORTANT GUIDELINES:
-1. Only extract terms that actually appear in THIS document
-2. For each term, provide:
-   - The term name (as it appears in the document)
-   - Full expanded name if abbreviated
-   - A one-line short description
-   - Plain English definition (explain like the borrower has no financial background)
-   - A contextual example using ACTUAL values from this specific document
-   - The actual value found in the document
-   - Page and section location
-3. Use appropriate icons:
-   - 💡 for informational/neutral examples
-   - ⚠️ for warnings or important cautions
-   - ✅ for positive/beneficial examples
-4. Make examples relatable and specific to this loan
-
-If no financial terms are found, return an empty array."""
-
-
-async def analyze_for_financial_terms(extraction: PDFExtraction, extractor) -> dict:
-    """
-    Use LLM to extract and explain financial terms from the document.
-    
-    Args:
-        extraction: PDFExtraction from pdf_extractor
-        extractor: PDFExtractor instance
-        
-    Returns:
-        Dict with financial terms list matching API_DESIGN.md schema
-    """
-    llm_input = extractor.prepare_for_llm(extraction)
-    
-    prompt = f"""Analyze this loan document and extract all financial/legal terms that need explanation.
-
-=== DOCUMENT TEXT ===
-{llm_input["document_text"]}
-
-=== TASK ===
-1. Scan the document for financial terminology
-2. Identify terms that borrowers might not understand
-3. For each term found, provide:
-   - Term name (as it appears)
-   - Full expanded name if abbreviated
-   - One-line summary
-   - Plain English definition
-   - Contextual example using actual values from THIS document
-   - The actual value from the document
-   - Page and section location
-
-Return your response as a JSON object with this exact structure:
-{{
-    "terms": [
-        {{
-            "name": "string - term as it appears (e.g., APR)",
-            "full_name": "string - expanded name (e.g., Annual Percentage Rate)",
-            "short_description": "string - one-line summary",
-            "definition": "string - plain English explanation",
-            "example": {{
-                "icon": "💡|⚠️|✅",
-                "title": "string",
-                "text": "string - example using actual values from this document"
-            }},
-            "your_value": "string - actual value from document (e.g., '13.2%', '$500')",
-            "location": {{"page": integer, "section": "string"}}
-        }}
-    ]
-}}
-
-If no terms are found, return {{"terms": []}}"""
-
-    result = await call_gemini(FINANCIAL_TERMS_SYSTEM_PROMPT, prompt)
-    
-    # Add IDs to each term
-    terms = []
-    for i, term in enumerate(result["terms"], start=1):
-        terms.append({
-            "id": f"term_{i:03d}",
-            "name": term["name"],
-            "full_name": term["full_name"],
-            "short_description": term["short_description"],
-            "definition": term["definition"],
-            "example": term["example"],
-            "your_value": term["your_value"],
-            "location": term["location"]
-        })
-    
-    return {
-        "count": len(terms),
-        "terms": terms
     }
 
 
@@ -936,11 +896,11 @@ def generate_financial_terms_from_regex_only(extraction: PDFExtraction) -> dict:
             "name": "API Key Required",
             "full_name": "AI Analysis Unavailable",
             "short_description": "Full term extraction requires AI analysis.",
-            "definition": "To extract and explain financial terms from your loan document, please enable AI analysis by setting the GEMINI_API_KEY environment variable.",
+            "definition": "To extract and explain financial terms from your loan document, please enable AI analysis by setting the GROQ_API_KEY environment variable.",
             "example": {
-                "icon": "⚠️",
+                "icon": "\u26a0\ufe0f",
                 "title": "Limited Analysis",
-                "text": "Set GEMINI_API_KEY to get detailed explanations of terms like APR, Principal, EMI, and more."
+                "text": "Set GROQ_API_KEY to get detailed explanations of terms like APR, Principal, EMI, and more."
             },
             "your_value": "N/A",
             "location": {"page": 1, "section": "General"}
@@ -952,26 +912,6 @@ def generate_financial_terms_from_regex_only(extraction: PDFExtraction) -> dict:
 # ==========================================================================
 # CHAT WITH DOCUMENT
 # ==========================================================================
-
-CHAT_SYSTEM_PROMPT = """You are a helpful assistant that answers questions about loan documents.
-Your role is to help borrowers understand their loan agreement by answering questions in plain, clear language.
-
-IMPORTANT GUIDELINES:
-1. Answer questions based ONLY on the document text provided
-2. If information is not in the document, say so clearly
-3. Use simple, non-technical language that anyone can understand
-4. When referencing specific clauses, include page numbers and section names
-5. Provide examples using actual values from the document when relevant
-6. Be helpful and empathetic - borrowers may be confused or concerned
-7. If asked about something that could be a problem (like penalties), explain it clearly
-8. Reference related clauses by their IDs if they were previously identified (e.g., hc_001, rf_001)
-
-TONE:
-- Friendly and approachable
-- Clear and direct
-- Supportive (this is a financial decision, people may be stressed)
-- Non-judgmental"""
-
 
 async def chat_with_document(
     extraction: PDFExtraction,
@@ -988,10 +928,13 @@ async def chat_with_document(
         extractor: PDFExtractor instance
         message: User's question
         conversation_history: Previous messages for context (optional)
+        analysis_context: Previously computed analysis (summary, red flags, etc.)
         
     Returns:
         Dict with response and references
     """
+    client = _get_groq_client()
+    
     llm_input = extractor.prepare_for_llm(extraction)
     
     # Build conversation context
@@ -1036,7 +979,7 @@ async def chat_with_document(
     
     context = "\n\n".join(context_parts)
     
-    prompt = f"""{context}
+    full_prompt = f"""{context}
 
 === CURRENT QUESTION ===
 {message}
@@ -1044,57 +987,37 @@ async def chat_with_document(
 Please answer this question about the loan document. Be specific, cite page numbers and sections when referencing the document, and use plain English."""
 
     try:
-        # For chat, we don't need structured JSON - just text response
-        model = get_gemini_model()
-        if model is None:
-            raise RuntimeError("GEMINI_API_KEY environment variable not set")
+        # For chat, we use plain text output (no structured JSON)
+        messages = [
+            {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+            {"role": "user", "content": full_prompt}
+        ]
         
-        # Create a model without JSON response format for chat
-        import google.generativeai as genai
-        chat_model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            generation_config={
-                "temperature": 0.7,  # Slightly higher for more natural conversation
-                "top_p": 0.95,
-                "top_k": 40,
-                "max_output_tokens": 2048,
-            }
+        # Native async call with AsyncGroq
+        response = await client.chat.completions.create(
+            model="qwen/qwen3-32b",
+            messages=messages,
+            temperature=0.7,  # Slightly higher for more natural conversation
+            max_completion_tokens=2048,
+            top_p=0.95,
+            stream=False,
         )
         
-        full_prompt = f"""{CHAT_SYSTEM_PROMPT}
-
----
-
-{context}
-
-=== CURRENT QUESTION ===
-{message}
-
-Please answer this question about the loan document. Be specific, cite page numbers and sections when referencing the document, and use plain English."""
+        response_text = response.choices[0].message.content
         
-        import asyncio
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: chat_model.generate_content(full_prompt)
-        )
-        
-        response_text = response.text
-        
-        # Try to extract references from the response text
-        # Look for patterns like "Section X.X" or "page Y"
-        references = []
-        # Simple extraction - could be improved with regex
-        # For now, we'll return empty references and let the LLM mention them in text
+        # Strip thinking tags if present
+        if "<think>" in response_text:
+            think_end = response_text.rfind("</think>")
+            if think_end != -1:
+                response_text = response_text[think_end + len("</think>"):].strip()
         
         return {
             "response": response_text,
-            "references": references
+            "references": []
         }
     except Exception as e:
         # Fallback response
         return {
-            "response": f"I apologize, but I'm having trouble processing your question right now. Please try rephrasing it or check that your GEMINI_API_KEY is set correctly. Error: {str(e)}",
+            "response": f"I apologize, but I'm having trouble processing your question right now. Please try rephrasing it or check that your GROQ_API_KEY is set correctly. Error: {str(e)}",
             "references": []
         }
-
