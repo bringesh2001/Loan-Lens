@@ -1,14 +1,71 @@
 import { useState, useCallback } from "react";
-import { Upload, Shield, FileText, ChevronRight, Sparkles, Lock, Eye } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useMutation } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { Upload, Shield, FileText, Sparkles, Lock, Eye, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { uploadDocument } from "@/lib/api";
+import { useDocument } from "@/context/DocumentContext";
 import heroBg from "@/assets/hero-bg.jpg";
 
-interface LandingPageProps {
-  onFileUpload: (file: File) => void;
-}
+// ==========================================================================
+// Zod Schema
+// ==========================================================================
 
-const LandingPage = ({ onFileUpload }: LandingPageProps) => {
+const uploadSchema = z.object({
+  file: z
+    .instanceof(File, { message: "Please select a file" })
+    .refine((f) => f.type === "application/pdf", "Only PDF files are accepted")
+    .refine((f) => f.size <= 20 * 1024 * 1024, "File must be under 20MB"),
+});
+
+type UploadFormData = z.infer<typeof uploadSchema>;
+
+// ==========================================================================
+// Component
+// ==========================================================================
+
+const LandingPage = () => {
   const [isDragging, setIsDragging] = useState(false);
+  const navigate = useNavigate();
+  const { setDocumentId, setFilePreviewUrl } = useDocument();
+
+  const {
+    setValue,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<UploadFormData>({
+    resolver: zodResolver(uploadSchema),
+  });
+
+  const mutation = useMutation({
+    mutationFn: (data: UploadFormData) => uploadDocument(data.file),
+    onSuccess: (response, variables) => {
+      // Generate local preview URL
+      const previewUrl = URL.createObjectURL(variables.file);
+      setFilePreviewUrl(previewUrl);
+      setDocumentId(response.document_id);
+      // Navigate immediately — don't wait for processing
+      navigate(`/dashboard/${response.document_id}`);
+    },
+    onError: (error) => {
+      toast.error("Upload Failed", {
+        description: error instanceof Error ? error.message : "Something went wrong",
+      });
+    },
+  });
+
+  const processFile = useCallback(
+    (file: File) => {
+      setValue("file", file, { shouldValidate: true });
+      // Trigger submission after setting value
+      handleSubmit((data) => mutation.mutate(data))();
+    },
+    [setValue, handleSubmit, mutation],
+  );
 
   const handleDrag = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -16,17 +73,20 @@ const LandingPage = ({ onFileUpload }: LandingPageProps) => {
     setIsDragging(e.type === "dragenter" || e.type === "dragover");
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file?.type === "application/pdf") onFileUpload(file);
-  }, [onFileUpload]);
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragging(false);
+      const file = e.dataTransfer.files?.[0];
+      if (file) processFile(file);
+    },
+    [processFile],
+  );
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) onFileUpload(file);
+    if (file) processFile(file);
   };
 
   return (
@@ -77,38 +137,59 @@ const LandingPage = ({ onFileUpload }: LandingPageProps) => {
             onDragLeave={handleDrag}
             onDragOver={handleDrag}
             onDrop={handleDrop}
-            className={`relative mx-auto max-w-lg rounded-2xl border-2 border-dashed p-10 transition-all duration-300 cursor-pointer group ${
-              isDragging
+            className={`relative mx-auto max-w-lg rounded-2xl border-2 border-dashed p-10 transition-all duration-300 cursor-pointer group ${isDragging
                 ? "border-accent bg-accent/5 scale-[1.02]"
-                : "border-border hover:border-accent/50 hover:bg-muted/50"
-            }`}
+                : mutation.isPending
+                  ? "border-accent/50 bg-accent/5"
+                  : "border-border hover:border-accent/50 hover:bg-muted/50"
+              }`}
           >
             <input
               type="file"
               accept=".pdf"
               onChange={handleFileInput}
-              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+              disabled={mutation.isPending}
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
             />
             <div className="flex flex-col items-center gap-4">
-              <div className={`w-16 h-16 rounded-2xl flex items-center justify-center transition-colors ${
-                isDragging ? "bg-accent/20" : "bg-muted group-hover:bg-accent/10"
-              }`}>
-                <Upload className={`w-7 h-7 transition-colors ${isDragging ? "text-accent" : "text-muted-foreground group-hover:text-accent"}`} />
+              <div
+                className={`w-16 h-16 rounded-2xl flex items-center justify-center transition-colors ${mutation.isPending
+                    ? "bg-accent/20"
+                    : isDragging
+                      ? "bg-accent/20"
+                      : "bg-muted group-hover:bg-accent/10"
+                  }`}
+              >
+                {mutation.isPending ? (
+                  <Loader2 className="w-7 h-7 text-accent animate-spin" />
+                ) : (
+                  <Upload
+                    className={`w-7 h-7 transition-colors ${isDragging ? "text-accent" : "text-muted-foreground group-hover:text-accent"
+                      }`}
+                  />
+                )}
               </div>
               <div>
                 <p className="text-base font-semibold text-foreground mb-1">
-                  Drop your loan PDF here
+                  {mutation.isPending ? "Uploading document..." : "Drop your loan PDF here"}
                 </p>
                 <p className="text-sm text-muted-foreground">
-                  or click to browse · PDF up to 20MB
+                  {mutation.isPending ? "Please wait while we process your file" : "or click to browse · PDF up to 20MB"}
                 </p>
               </div>
-              <Button variant="outline" size="sm" className="pointer-events-none">
-                <FileText className="w-4 h-4 mr-2" />
-                Select PDF
-              </Button>
+              {!mutation.isPending && (
+                <Button variant="outline" size="sm" className="pointer-events-none">
+                  <FileText className="w-4 h-4 mr-2" />
+                  Select PDF
+                </Button>
+              )}
             </div>
           </div>
+
+          {/* Validation error */}
+          {errors.file && (
+            <p className="text-sm text-destructive mt-3">{errors.file.message}</p>
+          )}
 
           {/* Trust badges */}
           <div className="flex flex-wrap items-center justify-center gap-6 mt-8 text-sm text-muted-foreground">

@@ -1,115 +1,345 @@
-import { FileText, ZoomIn, ZoomOut, ChevronLeft, ChevronRight } from "lucide-react";
+import { useState, useRef, useEffect, useCallback } from "react";
+import { Document, Page, pdfjs } from "react-pdf";
+import "react-pdf/dist/Page/AnnotationLayer.css";
+import "react-pdf/dist/Page/TextLayer.css";
+import { useDocument } from "@/context/DocumentContext";
+import { FileText, Upload, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 
-interface PdfViewerProps {
-  fileName: string;
-  highlightedClause?: string | null;
-  highlightedPage?: number | null;
+// ==========================================================================
+// PDF.js Worker Configuration
+// ==========================================================================
+
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  "react-pdf/node_modules/pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url,
+).toString();
+
+// ==========================================================================
+// Text Matching Utilities
+// ==========================================================================
+
+/** Strong normalization: lowercase, strip ellipses/currency/exotic punctuation, collapse whitespace */
+function normalize(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\.\.\./g, "")               // remove ellipsis
+    .replace(/[₹$€£¥]/g, "")             // remove currency symbols
+    .replace(/[^\w\s.%()-]/g, "")         // keep only word chars, spaces, ., %, (, ), -
+    .replace(/\s+/g, " ")                 // collapse whitespace
+    .trim();
 }
 
-const PdfViewer = ({ fileName, highlightedClause, highlightedPage }: PdfViewerProps) => {
-  const [zoom, setZoom] = useState(100);
-  const [page, setPage] = useState(1);
-  const totalPages = 14;
+/** Remove all existing highlights from the PDF */
+function clearHighlights() {
+  document.querySelectorAll(".pdf-highlight").forEach((el) => {
+    el.classList.remove("pdf-highlight");
+  });
+}
 
-  const currentPage = highlightedPage ?? page;
+/**
+ * Given a normalized page string and array of spans with their normalized texts,
+ * highlight all spans that overlap the match range [matchIndex, matchEnd).
+ * Returns the first highlighted element.
+ */
+function applyHighlightToRange(
+  spans: HTMLSpanElement[],
+  normalizedSpanTexts: string[],
+  matchIndex: number,
+  matchEnd: number,
+): HTMLElement | null {
+  let firstMatch: HTMLElement | null = null;
+  let cursor = 0;
 
-  return (
-    <div className="flex flex-col h-full bg-muted/30">
-      {/* Toolbar */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-card">
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <FileText className="w-4 h-4" />
-          <span className="truncate max-w-[200px] font-medium">{fileName}</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setZoom(z => Math.max(50, z - 25))}>
-            <ZoomOut className="w-4 h-4" />
-          </Button>
-          <span className="text-xs text-muted-foreground w-12 text-center">{zoom}%</span>
-          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setZoom(z => Math.min(200, z + 25))}>
-            <ZoomIn className="w-4 h-4" />
-          </Button>
-        </div>
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setPage(p => Math.max(1, p - 1))}>
-            <ChevronLeft className="w-4 h-4" />
-          </Button>
-          <span className="text-xs text-muted-foreground">
-            {currentPage} / {totalPages}
-          </span>
-          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setPage(p => Math.min(totalPages, p + 1))}>
-            <ChevronRight className="w-4 h-4" />
+  for (let i = 0; i < spans.length; i++) {
+    const spanStart = cursor;
+    const spanEnd = cursor + normalizedSpanTexts[i].length;
+
+    if (spanEnd > matchIndex && spanStart < matchEnd) {
+      spans[i].classList.add("pdf-highlight");
+      if (!firstMatch) firstMatch = spans[i];
+    }
+
+    cursor = spanEnd + 1; // +1 for the join space
+  }
+
+  return firstMatch;
+}
+
+/**
+ * 3-Layer multi-span matching:
+ *   Layer 1 — Full normalized snippet match
+ *   Layer 2 — First 15 words partial match
+ *   Layer 3 — Token-based fallback (top 5 meaningful words)
+ *
+ * Returns the first highlighted element (for scrolling), or null.
+ */
+function highlightSnippetInTextLayer(
+  pageContainer: HTMLDivElement,
+  snippet: string,
+): HTMLElement | null {
+  const textLayer = pageContainer.querySelector(
+    ".react-pdf__Page__textContent",
+  );
+  if (!textLayer) return null;
+
+  const spans = Array.from(textLayer.querySelectorAll("span")) as HTMLSpanElement[];
+  if (spans.length === 0) return null;
+
+  // Build normalized page text and per-span normalized texts
+  const spanTexts = spans.map((s) => s.textContent ?? "");
+  const normalizedSpanTexts = spanTexts.map(normalize);
+  const normalizedPage = normalizedSpanTexts.join(" ");
+  const normalizedSnippet = normalize(snippet);
+
+  // ── Layer 1: Full snippet match ─────────────────────────────────────
+  const fullIndex = normalizedPage.indexOf(normalizedSnippet);
+  if (fullIndex !== -1) {
+    return applyHighlightToRange(
+      spans,
+      normalizedSpanTexts,
+      fullIndex,
+      fullIndex + normalizedSnippet.length,
+    );
+  }
+
+  // ── Layer 2: First 15 words partial match ───────────────────────────
+  const words = normalizedSnippet.split(" ").filter(Boolean);
+  if (words.length > 5) {
+    const shortSnippet = words.slice(0, 15).join(" ");
+    const partialIndex = normalizedPage.indexOf(shortSnippet);
+    if (partialIndex !== -1) {
+      return applyHighlightToRange(
+        spans,
+        normalizedSpanTexts,
+        partialIndex,
+        partialIndex + shortSnippet.length,
+      );
+    }
+  }
+
+  // ── Layer 3: Token-based fallback ───────────────────────────────────
+  // Extract top 5 meaningful words (>4 chars) and highlight spans containing them
+  const keyTokens = words
+    .filter((w) => w.length > 4)
+    .slice(0, 5);
+
+  if (keyTokens.length === 0) return null;
+
+  let firstMatch: HTMLElement | null = null;
+
+  for (let i = 0; i < spans.length; i++) {
+    const spanNorm = normalizedSpanTexts[i];
+    const hasToken = keyTokens.some((token) => spanNorm.includes(token));
+    if (hasToken) {
+      spans[i].classList.add("pdf-highlight");
+      if (!firstMatch) firstMatch = spans[i];
+    }
+  }
+
+  return firstMatch;
+}
+
+// ==========================================================================
+// Component
+// ==========================================================================
+
+const PdfViewer = () => {
+  const { filePreviewUrl, highlightTarget } = useDocument();
+  const navigate = useNavigate();
+
+  const [numPages, setNumPages] = useState<number>(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [highlightPage, setHighlightPage] = useState<number | null>(null);
+  const [containerWidth, setContainerWidth] = useState<number>(0);
+
+  const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // ── Track container width for responsive page sizing ──────────────────
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setContainerWidth(entry.contentRect.width);
+      }
+    });
+
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  // ── Jump to page ──────────────────────────────────────────────────────
+  const jumpToPage = useCallback((page: number) => {
+    pageRefs.current[page]?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  }, []);
+
+  // ── Pure highlight applicator (no toggle logic) ───────────────────────
+  const highlightClause = useCallback(
+    (page: number, snippet?: string) => {
+      clearHighlights();
+      setHighlightPage(null);
+
+      // Scroll to page
+      jumpToPage(page);
+
+      // Wait for text layer render, then apply highlight
+      setTimeout(() => {
+        const pageContainer = pageRefs.current[page];
+        if (!pageContainer) return;
+
+        let scrollTarget: HTMLElement | null = null;
+
+        if (snippet) {
+          scrollTarget = highlightSnippetInTextLayer(pageContainer, snippet);
+        }
+
+        if (scrollTarget) {
+          scrollTarget.scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
+        } else {
+          // Fallback: no snippet or no match → yellow page ring
+          setHighlightPage(page);
+        }
+      }, 400);
+    },
+    [jumpToPage],
+  );
+
+  // ── React to highlight target from context ────────────────────────────
+  useEffect(() => {
+    // Target cleared (toggle off) → remove all highlights
+    if (!highlightTarget) {
+      clearHighlights();
+      setHighlightPage(null);
+      return;
+    }
+
+    // Target set → apply highlight
+    highlightClause(highlightTarget.page, highlightTarget.snippet);
+  }, [highlightTarget, highlightClause]);
+
+  // ── No Preview URL (page was refreshed) ───────────────────────────────
+  if (!filePreviewUrl) {
+    return (
+      <div className="flex flex-col h-full bg-muted/30 items-center justify-center p-8">
+        <div className="max-w-sm text-center">
+          <div className="w-16 h-16 rounded-2xl bg-muted flex items-center justify-center mx-auto mb-4">
+            <FileText className="w-8 h-8 text-muted-foreground" />
+          </div>
+          <h3 className="text-lg font-semibold text-foreground mb-2">
+            PDF Preview Unavailable
+          </h3>
+          <p className="text-sm text-muted-foreground mb-6 leading-relaxed">
+            PDF preview is unavailable due to a page refresh. Your analysis is
+            still available, but please re-upload to enable the document viewer
+            and clause highlighting.
+          </p>
+          <Button variant="outline" onClick={() => navigate("/")} className="gap-2">
+            <Upload className="w-4 h-4" />
+            Re-upload Document
           </Button>
         </div>
       </div>
+    );
+  }
 
-      {/* PDF Content (simulated) */}
-      <div className="flex-1 overflow-auto p-6">
-        <div
-          className="mx-auto bg-card rounded-lg shadow-lg border border-border p-8 max-w-2xl"
-          style={{ transform: `scale(${zoom / 100})`, transformOrigin: "top center" }}
-        >
-          <div className="space-y-4 text-sm text-foreground/80 leading-relaxed">
-            <div className="text-center mb-8">
-              <h2 className="text-lg font-bold text-foreground">HOME LOAN AGREEMENT</h2>
-              <p className="text-xs text-muted-foreground mt-1">Agreement No: HL/2024/045789</p>
+  // ── PDF Render ────────────────────────────────────────────────────────
+  return (
+    <div className="flex flex-col h-full bg-muted/30">
+      {/* Toolbar */}
+      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-card shrink-0">
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <FileText className="w-4 h-4" />
+          <span className="font-medium">Document Preview</span>
+        </div>
+        {numPages > 0 && (
+          <span className="text-xs text-muted-foreground font-mono">
+            {numPages} page{numPages !== 1 ? "s" : ""}
+          </span>
+        )}
+      </div>
+
+      {/* Scrollable multi-page PDF */}
+      <div
+        ref={containerRef}
+        className="flex-1 overflow-auto px-4 py-4"
+      >
+        <Document
+          file={filePreviewUrl}
+          onLoadSuccess={({ numPages: n }) => {
+            setNumPages(n);
+            setLoadError(null);
+          }}
+          onLoadError={(error) => {
+            setLoadError(error?.message || "Failed to load PDF.");
+          }}
+          loading={
+            <div className="flex items-center justify-center py-20">
+              <div className="flex flex-col items-center gap-3">
+                <div className="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+                <p className="text-sm text-muted-foreground">Loading PDF…</p>
+              </div>
             </div>
-
-            <p>
-              This Home Loan Agreement ("Agreement") is entered into on this 15th day of January, 2024,
-              by and between the Lender and the Borrower(s) whose details are set forth herein.
-            </p>
-
-            {highlightedClause && (
-              <div className="relative">
-                <div className="absolute -left-4 top-0 bottom-0 w-1 bg-accent rounded-full" />
-                <div className="bg-accent/10 border border-accent/30 rounded-lg p-4 transition-all duration-500">
-                  <p className="text-xs font-semibold text-accent mb-1">{highlightedClause}</p>
-                  <p className="text-sm">
-                    The Lender reserves the right to modify, amend, or revise the applicable interest rate
-                    at its sole discretion based on prevailing market conditions, changes in regulatory
-                    benchmarks, or internal policy revisions. Such modifications may be effected without
-                    prior written notice to the Borrower(s).
+          }
+          error={
+            <div className="rounded-lg border border-destructive/20 bg-destructive/5 p-4 mx-auto max-w-md">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-destructive mt-0.5 shrink-0" />
+                <div>
+                  <p className="text-sm font-semibold text-destructive">Failed to Load PDF</p>
+                  <p className="text-xs text-destructive/80 mt-1">
+                    {loadError || "The document could not be rendered. Please try re-uploading."}
                   </p>
                 </div>
               </div>
-            )}
+            </div>
+          }
+        >
+          <div className="flex flex-col items-center gap-4">
+            {Array.from({ length: numPages }, (_, i) => {
+              const pageNum = i + 1;
+              const isHighlighted = highlightPage === pageNum;
 
-            <p>
-              <strong>Section 1: Loan Details</strong>
-              <br />
-              1.1 The Lender agrees to extend a home loan facility of INR 45,00,000 (Indian Rupees
-              Forty-Five Lakhs Only) to the Borrower, subject to the terms and conditions detailed herein.
-            </p>
+              return (
+                <div
+                  key={pageNum}
+                  ref={(el) => {
+                    pageRefs.current[pageNum] = el;
+                  }}
+                  className={`relative rounded-lg shadow-md transition-all duration-500 ${isHighlighted
+                    ? "ring-4 ring-yellow-400/60 bg-yellow-200/30"
+                    : "bg-white"
+                    }`}
+                >
+                  {/* Fallback page-level highlight overlay */}
+                  {isHighlighted && (
+                    <div className="absolute inset-0 bg-yellow-200/25 rounded-lg pointer-events-none z-10 animate-pulse" />
+                  )}
 
-            <p>
-              1.2 The loan shall be disbursed in tranches or as a lump sum at the discretion of the Lender,
-              upon completion of all documentation and verification requirements.
-            </p>
+                  <Page
+                    pageNumber={pageNum}
+                    width={containerWidth > 0 ? containerWidth - 32 : undefined}
+                    renderTextLayer={true}
+                    renderAnnotationLayer={true}
+                  />
 
-            <p>
-              <strong>Section 2: Interest and Repayment</strong>
-              <br />
-              2.1 The applicable rate of interest shall be 8.75% per annum on a floating rate basis,
-              linked to the Lender's benchmark lending rate (RLLR/EBLR).
-            </p>
-
-            <p>
-              2.2 The Equated Monthly Installment (EMI) shall be INR 39,782 payable on the 5th of every
-              calendar month through auto-debit from the designated bank account.
-            </p>
-
-            <p>
-              2.3 The loan tenure shall be 240 months (20 years) from the date of first disbursement.
-            </p>
-
-            <p className="text-muted-foreground text-xs italic mt-8 text-center">
-              — Simulated PDF preview • Page {currentPage} of {totalPages} —
-            </p>
+                  {/* Page number badge */}
+                  <div className="absolute bottom-2 right-2 z-20 px-2 py-0.5 rounded bg-foreground/70 text-background text-[10px] font-mono">
+                    {pageNum}
+                  </div>
+                </div>
+              );
+            })}
           </div>
-        </div>
+        </Document>
       </div>
     </div>
   );
