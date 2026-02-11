@@ -10,6 +10,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Trigger reload
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 

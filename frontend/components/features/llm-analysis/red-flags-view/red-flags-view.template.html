@@ -1,0 +1,38 @@
+<div class="red-flags-container">
+    <!-- Loading State -->
+    <div id="rf-loading" class="loading-container">
+        <div class="spinner"></div>
+        <p>Analyzing document for potential risks...</p>
+        <p class="text-muted small">This usually takes 10-20 seconds.</p>
+    </div>
+
+    <!-- Error State -->
+    <div id="rf-error" class="error-container" style="display: none;">
+        <h3 style="color: var(--color-danger)">Analysis Failed</h3>
+        <p id="rf-error-msg" class="text-muted">Unable to load red flags.</p>
+        <button id="rf-retry-btn" class="btn btn-primary" style="margin-top: 1rem;">Retry Analysis</button>
+    </div>
+
+    <!-- Content State -->
+    <div id="rf-content" style="display: none;">
+        <div class="red-flags-header">
+            <h2 class="red-flags-title">
+                🚩 Potential Red Flags
+                <span id="rf-count" class="risk-count-badge">0</span>
+            </h2>
+            <p class="red-flags-subtitle">
+                We found the following terms that might be unfavorable or risky.
+                Please review them carefully.
+            </p>
+        </div>
+
+        <div id="rf-list" class="risk-list">
+            <!-- Risk items will be injected here -->
+        </div>
+
+        <div id="rf-empty" class="text-muted text-center" style="display: none; padding: 2rem;">
+            <h3>✅ No Major Red Flags Found</h3>
+            <p>Our AI didn't detect any critically unfair terms in this document.</p>
+        </div>
+    </div>
+</div>

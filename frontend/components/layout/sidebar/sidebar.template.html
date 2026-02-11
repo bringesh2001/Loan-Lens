@@ -1,0 +1,22 @@
+<div class="sidebar-overlay" id="sidebar-overlay">
+    <div class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <h2>Upload Document</h2>
+            <button class="close-btn" id="close-sidebar">&times;</button>
+        </div>
+        <div class="sidebar-content">
+            <div class="upload-area" id="upload-area">
+                <input type="file" id="file-input" accept=".pdf" hidden />
+                <label for="file-input" class="upload-label">
+                    <span class="icon">📄</span>
+                    <span>Choose a PDF file</span>
+                    <span class="sub-text">or drag and drop here</span>
+                </label>
+                <div id="file-name" class="file-name"></div>
+            </div>
+            <div class="actions">
+                <button id="upload-btn" class="btn-primary" disabled>Upload</button>
+            </div>
+        </div>
+    </div>
+</div>

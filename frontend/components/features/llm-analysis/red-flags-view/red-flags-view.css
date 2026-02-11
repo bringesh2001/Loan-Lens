@@ -1,0 +1,172 @@
+.red-flags-container {
+    padding-bottom: 2rem;
+    animation: fadeIn 0.3s ease-out;
+}
+
+.red-flags-header {
+    margin-bottom: 1.5rem;
+}
+
+.red-flags-title {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--color-text);
+    margin: 0 0 0.5rem 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.risk-count-badge {
+    background-color: var(--color-danger);
+    color: white;
+    font-size: 0.75rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 1rem;
+    font-weight: 700;
+}
+
+.red-flags-subtitle {
+    color: var(--color-muted);
+    font-size: 0.875rem;
+    line-height: 1.5;
+}
+
+/* Risk Cards */
+.risk-card {
+    background: white;
+    border-radius: var(--radius-md);
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border: 1px solid var(--color-border-subtle);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
+    transition: transform 0.2s, box-shadow 0.2s;
+    border-left: 4px solid transparent;
+}
+
+.risk-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+}
+
+/* Severity Styles */
+.risk-card.severity-high {
+    border-left-color: var(--color-danger);
+    background-color: #fff5f5;
+}
+
+.risk-card.severity-medium {
+    border-left-color: #f59e0b;
+    /* Amber */
+    background-color: #fffaf0;
+}
+
+.risk-card.severity-low {
+    border-left-color: #3b82f6;
+    /* Blue */
+    background-color: #eff6ff;
+}
+
+.risk-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 0.5rem;
+}
+
+.risk-title {
+    font-weight: 600;
+    font-size: 1rem;
+    color: var(--color-text);
+}
+
+.risk-severity {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    font-weight: 700;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    letter-spacing: 0.05em;
+}
+
+.severity-high .risk-severity {
+    background-color: rgba(249, 115, 115, 0.15);
+    color: var(--color-danger);
+}
+
+.severity-medium .risk-severity {
+    background-color: rgba(245, 158, 11, 0.15);
+    color: #b45309;
+}
+
+.severity-low .risk-severity {
+    background-color: rgba(59, 130, 246, 0.15);
+    color: #1d4ed8;
+}
+
+.risk-description {
+    font-size: 0.875rem;
+    color: var(--color-text);
+    margin-bottom: 0.75rem;
+    line-height: 1.5;
+}
+
+.risk-recommendation {
+    background-color: rgba(255, 255, 255, 0.6);
+    padding: 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.8125rem;
+    border: 1px dashed var(--color-border-subtle);
+}
+
+.rec-title {
+    font-weight: 600;
+    color: var(--color-primary-strong);
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+}
+
+/* Loading & Error States */
+.loading-container,
+.error-container {
+    text-align: center;
+    padding: 3rem 1rem;
+}
+
+.spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid rgba(124, 140, 255, 0.1);
+    border-radius: 50%;
+    border-top-color: var(--color-primary);
+    animation: spin 1s ease-in-out infinite;
+    margin: 0 auto 1rem;
+}
+
+.error-message {
+    color: var(--color-danger);
+    background: #fff5f5;
+    padding: 1rem;
+    border-radius: var(--radius-md);
+    margin-top: 1rem;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(5px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}

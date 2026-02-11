@@ -1,0 +1,88 @@
+/* Global styles and design tokens */
+
+:root {
+  --color-bg: #f5f5ff;
+  --color-surface: #ffffff;
+  --color-surface-elevated: #fdf9ff;
+  --color-primary: #7c8cff;
+  --color-primary-soft: rgba(124, 140, 255, 0.15);
+  --color-primary-strong: #5f6efc;
+  --color-danger: #f97373;
+  --color-muted: #6b7280;
+  --color-border-subtle: #e2e8f0;
+  --color-text: #111827;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --shadow-soft: 0 18px 40px rgba(15, 23, 42, 0.75);
+  --transition-fast: 0.18s ease-out;
+  --transition-med: 0.24s ease-out;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'SF Pro Text',
+    'Inter', sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: radial-gradient(circle at top, #eef2ff 0, #fdf2ff 55%, #ffffff 100%);
+  color: var(--color-text);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+  /* Prevent horizontal scroll */
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+}
+
+/* Simple layout shell for pages */
+
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+  width: 100%;
+}
+
+.app-shell__main {
+  flex: 1;
+  padding: 0;
+  width: 100%;
+}
+
+.page-enter {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.page-enter-active {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity var(--transition-med), transform var(--transition-med);
+}
+
+.text-muted {
+  color: var(--color-muted);
+}
+
+.card {
+  background: linear-gradient(145deg, #ffffff, #fdf9ff);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 14px 30px rgba(148, 163, 184, 0.35);
+  border: 1px solid rgba(209, 213, 219, 0.8);
+}

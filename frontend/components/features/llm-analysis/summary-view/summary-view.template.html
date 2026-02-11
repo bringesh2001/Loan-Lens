@@ -1,0 +1,58 @@
+<div class="summary-view">
+
+    <!-- Loading State -->
+    <div id="summary-loading" class="loading-state" style="display: none;">
+        <div class="loader"></div> <!-- Assuming global loader class exists or needs to be added -->
+        <p style="margin-top: 1rem">Analyzing document for key terms...</p>
+    </div>
+
+    <!-- Error State -->
+    <div id="summary-error" class="card" style="display: none; padding: 1.5rem; border-color: var(--color-danger);">
+        <h3 style="color: var(--color-danger); margin-top: 0;">Analysis Failed</h3>
+        <p id="summary-error-msg" class="text-muted"></p>
+        <button class="btn-primary" id="retry-btn" style="margin-top: 1rem; width: auto;">Retry Analysis</button>
+    </div>
+
+    <!-- Content State -->
+    <div id="summary-content" style="display: none;">
+
+        <!-- Overview -->
+        <div class="overview-card">
+            <div class="overview-header">
+                <span class="overview-icon">ℹ️</span>
+                <span>Document Overview</span>
+            </div>
+            <p class="overview-text" id="overview-text">
+                <!-- Text injected via JS -->
+            </p>
+        </div>
+
+        <!-- Key Numbers -->
+        <div class="section-title" style="margin-top: 1rem;">Key Numbers</div>
+        <div class="key-numbers-grid">
+            <div class="number-card">
+                <div class="number-label">Total Loan</div>
+                <div class="number-value" id="val-total-loan">-</div>
+            </div>
+            <div class="number-card">
+                <div class="number-label">Monthly Pay</div>
+                <div class="number-value" id="val-monthly-pay">-</div>
+            </div>
+            <div class="number-card">
+                <div class="number-label">Interest Rate</div>
+                <div class="number-value highlight" id="val-interest-rate">-</div>
+            </div>
+            <div class="number-card">
+                <div class="number-label">Term</div>
+                <div class="number-value" id="val-term">-</div>
+            </div>
+        </div>
+
+        <!-- Highlights -->
+        <div class="section-title" style="margin-top: 1rem;">What this means</div>
+        <div class="highlights-section" id="highlights-container">
+            <!-- Highlights injected via JS -->
+        </div>
+
+    </div>
+</div>

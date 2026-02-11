@@ -1,0 +1,47 @@
+<div class="analysis-container">
+    <!-- Left Panel: PDF Preview -->
+    <div class="pdf-panel">
+        <div class="pdf-container-card">
+            <div class="pdf-header">
+                <span class="pdf-icon">📄</span>
+                <span class="pdf-title">PDF Document Preview</span>
+            </div>
+            <iframe id="pdf-frame" class="pdf-viewer"></iframe>
+            <div class="pdf-footer">
+                <span class="page-pill">Page 1</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Right Panel: Analysis Tabs -->
+    <div class="results-panel">
+        <div class="tabs-header">
+            <button class="tab-btn active" data-tab="summary">Summary</button>
+            <button class="tab-btn" data-tab="red-flags">Red Flags</button>
+            <button class="tab-btn" data-tab="hidden-clauses">Hidden Clauses</button>
+            <button class="tab-btn" data-tab="financial-terms">Financial Terms</button>
+            <button class="tab-btn" data-tab="chat">Chat</button>
+        </div>
+
+        <div class="tab-content" id="tab-content">
+            <!-- Summary Tab -->
+            <div class="tab-pane active" id="tab-summary">
+                <div id="summary-view-container"></div>
+            </div>
+
+            <!-- Other Tabs (Placeholders) -->
+            <div class="tab-pane" id="tab-red-flags">
+                <p class="text-muted">Red Flags analysis coming soon...</p>
+            </div>
+            <div class="tab-pane" id="tab-hidden-clauses">
+                <p class="text-muted">Hidden Clauses analysis coming soon...</p>
+            </div>
+            <div class="tab-pane" id="tab-financial-terms">
+                <p class="text-muted">Financial Terms analysis coming soon...</p>
+            </div>
+            <div class="tab-pane" id="tab-chat">
+                <p class="text-muted">Chat feature coming soon...</p>
+            </div>
+        </div>
+    </div>
+</div>

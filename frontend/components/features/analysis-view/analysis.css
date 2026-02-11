@@ -1,0 +1,144 @@
+.analysis-container {
+    display: flex;
+    height: calc(100vh - 64px);
+    /* Subtract navbar height */
+    background-color: var(--color-bg);
+}
+
+.pdf-panel {
+    flex: 1;
+    background-color: var(--color-bg);
+    /* Light gray background */
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 2rem;
+    overflow: hidden;
+    min-width: 0;
+    /* Important for flex items to shrink below content size */
+}
+
+.pdf-container-card {
+    width: 100%;
+    max-width: 800px;
+    height: 100%;
+    background-color: white;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+    /* Soft shadow */
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.pdf-header {
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid var(--color-border-subtle);
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    background-color: white;
+}
+
+.pdf-icon {
+    font-size: 1.25rem;
+}
+
+.pdf-title {
+    font-weight: 500;
+    color: var(--color-on-surface);
+    font-size: 0.9rem;
+}
+
+.pdf-viewer {
+    flex: 1;
+    width: 100%;
+    border: none;
+    display: block;
+}
+
+.pdf-footer {
+    padding: 0.75rem;
+    border-top: 1px solid var(--color-border-subtle);
+    display: flex;
+    justify-content: center;
+    background-color: white;
+}
+
+.page-pill {
+    background-color: var(--color-bg);
+    padding: 0.25rem 0.75rem;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--color-muted);
+}
+
+.results-panel {
+    width: 450px;
+    background-color: var(--color-surface);
+    border-left: 1px solid var(--color-border-subtle);
+    display: flex;
+    flex-direction: column;
+    box-shadow: -4px 0 15px rgba(0, 0, 0, 0.05);
+    overflow: hidden;
+}
+
+/* Tabs */
+.tabs-header {
+    display: flex;
+    border-bottom: 1px solid var(--color-border-subtle);
+    background: var(--color-surface);
+    z-index: 10;
+}
+
+.tab-btn {
+    flex: 1;
+    padding: 1rem 0.5rem;
+    border: none;
+    background: none;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--color-muted);
+    cursor: pointer;
+    transition: all 0.2s;
+    border-bottom: 2px solid transparent;
+}
+
+.tab-btn:hover {
+    color: var(--color-primary);
+    background-color: var(--color-surface-elevated);
+}
+
+.tab-btn.active {
+    color: var(--color-primary-strong);
+    border-bottom-color: var(--color-primary);
+    font-weight: 600;
+}
+
+.tab-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1.5rem;
+}
+
+.tab-pane {
+    display: none;
+    animation: fadeIn 0.3s ease;
+}
+
+.tab-pane.active {
+    display: block;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(5px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
