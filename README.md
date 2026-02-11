@@ -23,7 +23,7 @@
 ### Backend
 - **FastAPI** — async Python API framework
 - **LlamaParse** — PDF text extraction
-- **Groq** — LLM inference (Llama 3)
+- **Groq** — LLM inference (Qwen 3)
 - **Pydantic v2** — request/response validation
 
 ### Frontend
