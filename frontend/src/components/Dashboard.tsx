@@ -19,10 +19,19 @@ import ChatTab from "@/components/ChatTab";
 const Dashboard = () => {
   const [activeTab, setActiveTab] = useState("summary");
   const navigate = useNavigate();
-  const { documentId, setHighlightTarget } = useDocument();
+  const { documentId, highlightTarget, setHighlightTarget } = useDocument();
 
-  const handleClauseClick = (_clauseRef: string, page: number, section: string) => {
-    setHighlightTarget({ page, section, timestamp: Date.now() });
+  const handleClauseClick = (_clauseRef: string, page: number, section: string, snippet?: string) => {
+    // Toggle: if clicking the same clause, clear highlight
+    if (
+      highlightTarget &&
+      highlightTarget.page === page &&
+      highlightTarget.section === section
+    ) {
+      setHighlightTarget(null);
+    } else {
+      setHighlightTarget({ page, section, snippet });
+    }
   };
 
   return (

@@ -109,4 +109,10 @@
   .risk-low {
     @apply bg-[hsl(var(--success))]/10 text-[hsl(var(--success))] border-[hsl(var(--success))]/20;
   }
+
+  .pdf-highlight {
+    background-color: rgba(255, 235, 59, 0.7) !important;
+    border-radius: 3px;
+    transition: background-color 0.3s ease;
+  }
 }

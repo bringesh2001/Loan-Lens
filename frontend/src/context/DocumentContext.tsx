@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from "react";
+import type { CurrencyInfo } from "@/lib/currency";
 
 // ==========================================================================
 // Highlight Target
@@ -7,7 +8,7 @@ import { createContext, useContext, useState, useCallback, type ReactNode } from
 export interface HighlightTarget {
     page: number;
     section: string;
-    timestamp: number; // ensures re-navigation to same page
+    snippet?: string; // exact text to highlight in the PDF text layer
 }
 
 // ==========================================================================
@@ -19,10 +20,12 @@ interface DocumentContextValue {
     filePreviewUrl: string | null;
     conversationId: string | null;
     highlightTarget: HighlightTarget | null;
+    currencyInfo: CurrencyInfo | null;
     setDocumentId: (id: string | null) => void;
     setFilePreviewUrl: (url: string | null) => void;
     setConversationId: (id: string | null) => void;
     setHighlightTarget: (target: HighlightTarget | null) => void;
+    setCurrencyInfo: (info: CurrencyInfo | null) => void;
     clearDocument: () => void;
 }
 
@@ -41,6 +44,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     const [filePreviewUrl, setFilePreviewUrl] = useState<string | null>(null);
     const [conversationId, setConversationId] = useState<string | null>(null);
     const [highlightTarget, setHighlightTarget] = useState<HighlightTarget | null>(null);
+    const [currencyInfo, setCurrencyInfo] = useState<CurrencyInfo | null>(null);
 
     const clearDocument = useCallback(() => {
         if (filePreviewUrl) {
@@ -50,6 +54,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         setFilePreviewUrl(null);
         setConversationId(null);
         setHighlightTarget(null);
+        setCurrencyInfo(null);
     }, [filePreviewUrl]);
 
     return (
@@ -59,10 +64,12 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
                 filePreviewUrl,
                 conversationId,
                 highlightTarget,
+                currencyInfo,
                 setDocumentId,
                 setFilePreviewUrl,
                 setConversationId,
                 setHighlightTarget,
+                setCurrencyInfo,
                 clearDocument,
             }}
         >

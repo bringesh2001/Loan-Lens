@@ -2,15 +2,17 @@ import { useQuery } from "@tanstack/react-query";
 import { useDocument } from "@/context/DocumentContext";
 import { getSummary } from "@/lib/api";
 import { Skeleton } from "@/components/ui/skeleton";
-import { DollarSign, Percent, Calendar, TrendingUp, CreditCard, AlertCircle, CheckCircle, AlertTriangle } from "lucide-react";
+import { Banknote, Percent, Calendar, TrendingUp, CreditCard, AlertCircle, CheckCircle, AlertTriangle, FileText } from "lucide-react";
 import type { Highlight } from "@/lib/types";
+import { useEffect } from "react";
+import { detectCurrency, formatMoney } from "@/lib/currency";
 
 // ==========================================================================
 // Component
 // ==========================================================================
 
 const SummaryTab = () => {
-  const { documentId } = useDocument();
+  const { documentId, currencyInfo, setCurrencyInfo } = useDocument();
 
   const { data, isLoading } = useQuery({
     queryKey: ["summary", documentId],
@@ -19,6 +21,22 @@ const SummaryTab = () => {
     refetchInterval: (query) =>
       query.state.data?.status === "processing" ? 3000 : false,
   });
+
+  // ── Detect currency once when summary loads ───────────────────────────
+  useEffect(() => {
+    if (!data?.data || currencyInfo) return;
+
+    const overview = data.data.overview ?? "";
+    const detected = detectCurrency(overview);
+    setCurrencyInfo(detected);
+  }, [data, currencyInfo, setCurrencyInfo]);
+
+  // ── Helper: format a money value ──────────────────────────────────────
+  const money = (value: number | null | undefined) => {
+    if (value == null) return "—";
+    if (!currencyInfo) return value.toLocaleString();
+    return formatMoney(value, currencyInfo.currency, currencyInfo.locale);
+  };
 
   // ── Loading / Processing ──────────────────────────────────────────────
   if (isLoading || !data || data.status === "processing") {
@@ -47,12 +65,12 @@ const SummaryTab = () => {
   const kn = summary.key_numbers;
 
   const items = [
-    { icon: DollarSign, label: "Loan Amount", value: kn.total_loan != null ? `$${kn.total_loan.toLocaleString()}` : "—" },
+    { icon: Banknote, label: "Loan Amount", value: money(kn.total_loan) },
     { icon: TrendingUp, label: "Interest Rate", value: kn.interest_rate != null ? `${kn.interest_rate}%` : "—" },
     { icon: Calendar, label: "Term", value: kn.term_months != null ? `${kn.term_months} months` : "—" },
-    { icon: CreditCard, label: "Monthly Payment", value: kn.monthly_payment != null ? `$${kn.monthly_payment.toLocaleString()}` : "—" },
-    { icon: Percent, label: "Total Interest", value: kn.total_interest != null ? `$${kn.total_interest.toLocaleString()}` : "—" },
-    { icon: DollarSign, label: "Document Type", value: summary.document_type },
+    { icon: CreditCard, label: "Monthly Payment", value: money(kn.monthly_payment) },
+    { icon: Percent, label: "Total Interest", value: money(kn.total_interest) },
+    { icon: FileText, label: "Document Type", value: summary.document_type },
   ];
 
   return (
@@ -79,10 +97,10 @@ const SummaryTab = () => {
             <div
               key={i}
               className={`flex items-start gap-2 text-sm rounded-lg p-2.5 ${h.type === "positive"
-                  ? "bg-[hsl(var(--success))]/10 text-[hsl(var(--success))]"
-                  : h.type === "negative"
-                    ? "bg-destructive/10 text-destructive"
-                    : "bg-[hsl(var(--warning))]/10 text-[hsl(var(--warning))]"
+                ? "bg-[hsl(var(--success))]/10 text-[hsl(var(--success))]"
+                : h.type === "negative"
+                  ? "bg-destructive/10 text-destructive"
+                  : "bg-[hsl(var(--warning))]/10 text-[hsl(var(--warning))]"
                 }`}
             >
               {h.type === "positive" ? (

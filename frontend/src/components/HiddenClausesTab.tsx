@@ -21,7 +21,7 @@ const impactStyles = {
 
 interface HiddenClausesTabProps {
   activeTab: string;
-  onClauseClick: (clauseRef: string, page: number, section: string) => void;
+  onClauseClick: (clauseRef: string, page: number, section: string, snippet?: string) => void;
 }
 
 // ==========================================================================
@@ -77,7 +77,7 @@ const HiddenClausesTab = ({ activeTab, onClauseClick }: HiddenClausesTabProps) =
       {clauses.map((clause: HiddenClause) => (
         <button
           key={clause.id}
-          onClick={() => onClauseClick(clause.location.section, clause.location.page, clause.location.section)}
+          onClick={() => onClauseClick(clause.location.section, clause.location.page, clause.location.section, clause.original_text)}
           className={`w-full text-left rounded-lg border p-3.5 transition-all hover:shadow-md group ${impactStyles[clause.impact] ?? impactStyles.low
             }`}
         >

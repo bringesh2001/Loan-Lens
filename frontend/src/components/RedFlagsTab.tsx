@@ -21,7 +21,7 @@ const severityConfig = {
 
 interface RedFlagsTabProps {
   activeTab: string;
-  onClauseClick: (clauseRef: string, page: number, section: string) => void;
+  onClauseClick: (clauseRef: string, page: number, section: string, snippet?: string) => void;
 }
 
 // ==========================================================================
@@ -82,7 +82,7 @@ const RedFlagsTab = ({ activeTab, onClauseClick }: RedFlagsTabProps) => {
         return (
           <button
             key={flag.id}
-            onClick={() => onClauseClick(flag.location.section, flag.location.page, flag.location.section)}
+            onClick={() => onClauseClick(flag.location.section, flag.location.page, flag.location.section, flag.description)}
             className={`w-full text-left rounded-lg border p-3.5 transition-all hover:shadow-md ${config.className}`}
           >
             <div className="flex items-start justify-between gap-2">

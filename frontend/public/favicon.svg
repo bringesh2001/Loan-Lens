@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Lens circle -->
+  <circle cx="26" cy="26" r="18" fill="none" stroke="#3b82f6" stroke-width="5"/>
+  <!-- Glass fill -->
+  <circle cx="26" cy="26" r="14" fill="#dbeafe" opacity="0.5"/>
+  <!-- Glass shine -->
+  <ellipse cx="20" cy="20" rx="5" ry="3" fill="white" opacity="0.6" transform="rotate(-30 20 20)"/>
+  <!-- Handle -->
+  <line x1="39" y1="39" x2="58" y2="58" stroke="#1e40af" stroke-width="6" stroke-linecap="round"/>
+  <!-- Document inside lens -->
+  <rect x="18" y="17" width="16" height="18" rx="1.5" fill="white" stroke="#3b82f6" stroke-width="1.5"/>
+  <line x1="21" y1="22" x2="31" y2="22" stroke="#93c5fd" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="21" y1="26" x2="29" y2="26" stroke="#93c5fd" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="21" y1="30" x2="27" y2="30" stroke="#f59e0b" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

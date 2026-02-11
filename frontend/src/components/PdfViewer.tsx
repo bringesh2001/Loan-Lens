@@ -17,6 +17,131 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 ).toString();
 
 // ==========================================================================
+// Text Matching Utilities
+// ==========================================================================
+
+/** Strong normalization: lowercase, strip ellipses/currency/exotic punctuation, collapse whitespace */
+function normalize(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\.\.\./g, "")               // remove ellipsis
+    .replace(/[₹$€£¥]/g, "")             // remove currency symbols
+    .replace(/[^\w\s.%()-]/g, "")         // keep only word chars, spaces, ., %, (, ), -
+    .replace(/\s+/g, " ")                 // collapse whitespace
+    .trim();
+}
+
+/** Remove all existing highlights from the PDF */
+function clearHighlights() {
+  document.querySelectorAll(".pdf-highlight").forEach((el) => {
+    el.classList.remove("pdf-highlight");
+  });
+}
+
+/**
+ * Given a normalized page string and array of spans with their normalized texts,
+ * highlight all spans that overlap the match range [matchIndex, matchEnd).
+ * Returns the first highlighted element.
+ */
+function applyHighlightToRange(
+  spans: HTMLSpanElement[],
+  normalizedSpanTexts: string[],
+  matchIndex: number,
+  matchEnd: number,
+): HTMLElement | null {
+  let firstMatch: HTMLElement | null = null;
+  let cursor = 0;
+
+  for (let i = 0; i < spans.length; i++) {
+    const spanStart = cursor;
+    const spanEnd = cursor + normalizedSpanTexts[i].length;
+
+    if (spanEnd > matchIndex && spanStart < matchEnd) {
+      spans[i].classList.add("pdf-highlight");
+      if (!firstMatch) firstMatch = spans[i];
+    }
+
+    cursor = spanEnd + 1; // +1 for the join space
+  }
+
+  return firstMatch;
+}
+
+/**
+ * 3-Layer multi-span matching:
+ *   Layer 1 — Full normalized snippet match
+ *   Layer 2 — First 15 words partial match
+ *   Layer 3 — Token-based fallback (top 5 meaningful words)
+ *
+ * Returns the first highlighted element (for scrolling), or null.
+ */
+function highlightSnippetInTextLayer(
+  pageContainer: HTMLDivElement,
+  snippet: string,
+): HTMLElement | null {
+  const textLayer = pageContainer.querySelector(
+    ".react-pdf__Page__textContent",
+  );
+  if (!textLayer) return null;
+
+  const spans = Array.from(textLayer.querySelectorAll("span")) as HTMLSpanElement[];
+  if (spans.length === 0) return null;
+
+  // Build normalized page text and per-span normalized texts
+  const spanTexts = spans.map((s) => s.textContent ?? "");
+  const normalizedSpanTexts = spanTexts.map(normalize);
+  const normalizedPage = normalizedSpanTexts.join(" ");
+  const normalizedSnippet = normalize(snippet);
+
+  // ── Layer 1: Full snippet match ─────────────────────────────────────
+  const fullIndex = normalizedPage.indexOf(normalizedSnippet);
+  if (fullIndex !== -1) {
+    return applyHighlightToRange(
+      spans,
+      normalizedSpanTexts,
+      fullIndex,
+      fullIndex + normalizedSnippet.length,
+    );
+  }
+
+  // ── Layer 2: First 15 words partial match ───────────────────────────
+  const words = normalizedSnippet.split(" ").filter(Boolean);
+  if (words.length > 5) {
+    const shortSnippet = words.slice(0, 15).join(" ");
+    const partialIndex = normalizedPage.indexOf(shortSnippet);
+    if (partialIndex !== -1) {
+      return applyHighlightToRange(
+        spans,
+        normalizedSpanTexts,
+        partialIndex,
+        partialIndex + shortSnippet.length,
+      );
+    }
+  }
+
+  // ── Layer 3: Token-based fallback ───────────────────────────────────
+  // Extract top 5 meaningful words (>4 chars) and highlight spans containing them
+  const keyTokens = words
+    .filter((w) => w.length > 4)
+    .slice(0, 5);
+
+  if (keyTokens.length === 0) return null;
+
+  let firstMatch: HTMLElement | null = null;
+
+  for (let i = 0; i < spans.length; i++) {
+    const spanNorm = normalizedSpanTexts[i];
+    const hasToken = keyTokens.some((token) => spanNorm.includes(token));
+    if (hasToken) {
+      spans[i].classList.add("pdf-highlight");
+      if (!firstMatch) firstMatch = spans[i];
+    }
+  }
+
+  return firstMatch;
+}
+
+// ==========================================================================
 // Component
 // ==========================================================================
 
@@ -54,26 +179,51 @@ const PdfViewer = () => {
     });
   }, []);
 
-  // ── Highlight clause (jump + yellow flash) ────────────────────────────
+  // ── Pure highlight applicator (no toggle logic) ───────────────────────
   const highlightClause = useCallback(
-    (page: number) => {
+    (page: number, snippet?: string) => {
+      clearHighlights();
+      setHighlightPage(null);
+
+      // Scroll to page
       jumpToPage(page);
-      setHighlightPage(page);
+
+      // Wait for text layer render, then apply highlight
+      setTimeout(() => {
+        const pageContainer = pageRefs.current[page];
+        if (!pageContainer) return;
+
+        let scrollTarget: HTMLElement | null = null;
+
+        if (snippet) {
+          scrollTarget = highlightSnippetInTextLayer(pageContainer, snippet);
+        }
+
+        if (scrollTarget) {
+          scrollTarget.scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
+        } else {
+          // Fallback: no snippet or no match → yellow page ring
+          setHighlightPage(page);
+        }
+      }, 400);
     },
     [jumpToPage],
   );
 
-  // ── Auto-clear highlight after 2.5s ───────────────────────────────────
-  useEffect(() => {
-    if (highlightPage === null) return;
-    const timer = setTimeout(() => setHighlightPage(null), 2500);
-    return () => clearTimeout(timer);
-  }, [highlightPage]);
-
   // ── React to highlight target from context ────────────────────────────
   useEffect(() => {
-    if (!highlightTarget) return;
-    highlightClause(highlightTarget.page);
+    // Target cleared (toggle off) → remove all highlights
+    if (!highlightTarget) {
+      clearHighlights();
+      setHighlightPage(null);
+      return;
+    }
+
+    // Target set → apply highlight
+    highlightClause(highlightTarget.page, highlightTarget.snippet);
   }, [highlightTarget, highlightClause]);
 
   // ── No Preview URL (page was refreshed) ───────────────────────────────
@@ -169,7 +319,7 @@ const PdfViewer = () => {
                     : "bg-white"
                     }`}
                 >
-                  {/* Yellow highlight overlay */}
+                  {/* Fallback page-level highlight overlay */}
                   {isHighlighted && (
                     <div className="absolute inset-0 bg-yellow-200/25 rounded-lg pointer-events-none z-10 animate-pulse" />
                   )}
